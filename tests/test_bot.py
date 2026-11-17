@@ -65,7 +65,7 @@ class ScheduleTests(DatabaseCase, unittest.TestCase):
         self.assertIn("1 пара (09:05 – 10:40)", formatted)
         self.assertIn("Биология", formatted)
         self.assertIn("Социально-экономическая география", formatted)
-        self.assertIn("Окно / нет пары", formatted)
+        self.assertIn("❌ Пропуск", formatted)
         self.assertIn("Спортзал", formatted)
         self.assertIn("&lt;важно&gt; &amp; всем", formatted)
         self.assertEqual(learned, [("Биология", "Каб. 12А")])
@@ -74,6 +74,36 @@ class ScheduleTests(DatabaseCase, unittest.TestCase):
         for raw in ("25:30–26:00 Биология", "10:40–09:05 Биология", "09:05–10:40"):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 schedule.format_schedule_blocks(raw, "2026-11-16", False)
+
+    def test_subject_emojis_for_names_tags_and_legacy_schedule(self):
+        cases = (
+            ("матан", "математика", "📐"), ("общество", "обществознание", "👥"),
+            ("литература", "литература", "📖"), ("русский_язык", "русский язык", "✍️"),
+            ("физика", "физика", "⚛️"), ("физкультура", "физическая культура", "⚽"),
+            ("химия", "химия", "🧪"), ("английский_язык", "английский язык", "🇬🇧"),
+            ("немецкий_язык", "немецкий язык", "🇩🇪"),
+            ("ОБЗР", "Основы безопасности и защиты Родины", "🛡️"),
+            ("ОИД", "Основы исследовательской деятельности", "🔎"),
+            ("история", "история", "🏛️"), ("информатика", "информатика", "💻"),
+            ("география", "география", "🌍"), ("микробио", "микробиология", "🔬"),
+        )
+        for tag, name, emoji in cases:
+            with self.subTest(name=name):
+                self.assertEqual(schedule.pick_subject_emoji(name), emoji)
+                self.assertEqual(schedule.pick_subject_emoji("#" + tag), emoji)
+        formatted, rooms = schedule.format_schedule_blocks(
+            "Пропуск\nНет пары\n—\n09:05–10:40 #Матан 12", "2026-11-16", False,
+        )
+        self.assertEqual(formatted.count("❌ Пропуск"), 3)
+        self.assertIn("📐 #Матан\n📍 Каб. 12", formatted)
+        self.assertEqual(rooms, [("#Матан", "Каб. 12")])
+        legacy = "<b>1 пара (08:30 – 10:05)</b>\n📚 География\n📍 Каб. 3\n\n<b>2 пара</b>\n⏸ Окно / нет пары"
+        storage.save_schedule("2026-11-16", "published", legacy)
+        for view in (main.build_schedule_view, main.group_interface.schedule_screen):
+            text = view("today")[0]
+            self.assertIn("🌍 География", text)
+            self.assertIn("❌ Окно / нет пары", text)
+        self.assertEqual(storage.get_schedule("2026-11-16")[1], legacy)
 
     def test_schedule_statuses(self):
         day = "2026-11-16"

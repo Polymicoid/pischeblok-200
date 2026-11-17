@@ -8,7 +8,10 @@ from aiogram.types import (
     InlineKeyboardMarkup, InputMediaPhoto, Message,
 )
 
-from schedule import MONTHS_GEN, ScheduleHTML, format_day_btn, format_updated_human, get_target_date, telegram_length
+from schedule import (
+    MONTHS_GEN, ScheduleHTML, format_day_btn, format_updated_human,
+    get_target_date, refresh_subject_emojis, telegram_length,
+)
 from storage import get_schedule, get_topic_screen, save_topic_screen
 
 BRAND = "👹 ПИЩЕБЛОК-200 | Учебный помощник"
@@ -53,7 +56,9 @@ def schedule_screen(day: str) -> tuple[str, str | None]:
     if status == "holiday":
         body = "🏖 <b>Выходной / занятий нет</b>"
     else:
-        body = content or ("📸 Расписание на фото" if photo else "⏳ Текст расписания отсутствует")
+        body = refresh_subject_emojis(content) if content else (
+            "📸 Расписание на фото" if photo else "⏳ Текст расписания отсутствует"
+        )
 
         def pair_heading(match: re.Match) -> str:
             number = int(match[1])

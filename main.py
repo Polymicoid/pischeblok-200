@@ -20,7 +20,7 @@ import group_interface
 from config import ConfigError, load_config
 from schedule import (
     ScheduleHTML, format_date_human, format_day_btn, format_schedule_blocks,
-    format_updated_human, get_now, get_target_date, telegram_length,
+    format_updated_human, get_now, get_target_date, refresh_subject_emojis, telegram_length,
 )
 from storage import (
     bind_topic, clear_subject_rooms, delete_schedule, get_all_subject_rooms,
@@ -256,7 +256,7 @@ def format_post_body(date_str: str, status: str, content: str | None, updated_at
     if status == "holiday":
         body = f"{header}\n\n🏖 <b>Выходной / занятий нет.</b>"
     elif content:
-        body = f"{header}\n\n{content}"
+        body = f"{header}\n\n{refresh_subject_emojis(content)}"
     else:
         body = header
 

@@ -91,8 +91,36 @@ def calculate_pair_times(date_str: str, has_class_hour: bool) -> dict[int, str]:
     return times
 
 
+SUBJECT_EMOJIS = {
+    "математика": "📐", "матан": "📐",
+    "обществознание": "👥", "общество": "👥",
+    "литература": "📖",
+    "русский язык": "✍️",
+    "физика": "⚛️",
+    "физическая культура": "⚽", "физкультура": "⚽", "физра": "⚽",
+    "химия": "🧪",
+    "английский язык": "🇬🇧", "английский": "🇬🇧",
+    "немецкий язык": "🇩🇪", "немецкий": "🇩🇪",
+    "основы безопасности и защиты родины": "🛡️", "обзр": "🛡️",
+    "основы исследовательской деятельности": "🔎", "оид": "🔎",
+    "история": "🏛️",
+    "информатика": "💻",
+    "география": "🌍",
+    "микробиология": "🔬", "микробио": "🔬",
+}
+EMPTY_PAIRS = {"-", "–", "—", "окно", "нет", "нет пары", "свободно", "пропуск", "пропуски", "окно / нет пары"}
+
+
+def subject_key(subject: str) -> str:
+    return " ".join(subject.casefold().strip().removeprefix("#").replace("_", " ").split())
+
+
 def pick_subject_emoji(subject: str) -> str:
-    s = subject.lower()
+    s = subject_key(subject)
+    if s in EMPTY_PAIRS:
+        return "❌"
+    if s in SUBJECT_EMOJIS:
+        return SUBJECT_EMOJIS[s]
     rules = [
         (["микробио", "биолог", "экол", "анатом", "генет"], "🔬"),
         (["хим"], "🧪"),
@@ -111,6 +139,17 @@ def pick_subject_emoji(subject: str) -> str:
         if any(k in s for k in keywords):
             return emoji
     return "📚"
+
+
+def refresh_subject_emojis(content: str) -> str:
+    """Обновляет значки в сохранённых блоках пар, сохраняя текст и HTML."""
+    def replace(match: re.Match) -> str:
+        heading, old_emoji, subject = match.groups()
+        key = subject_key(html.unescape(subject))
+        emoji = "❌" if key in EMPTY_PAIRS else SUBJECT_EMOJIS.get(key, old_emoji)
+        return f"{heading}{emoji} {subject}"
+
+    return re.sub(r"(?m)^(<b>\d+ пара(?: \([^\n]*\))?</b>\n)([^\w\s]+) ([^\n]+)$", replace, content)
 
 
 def format_schedule_blocks(raw_text: str, date_str: str, has_class_hour: bool) -> tuple[str, list[tuple[str, str]]]:
@@ -162,9 +201,9 @@ def format_schedule_blocks(raw_text: str, date_str: str, has_class_hour: bool) -
         else:
             time_str = pair_times.get(pair_num, "")
 
-        if rest.lower() in ("-", "—", "окно", "нет", "нет пары", "свободно"):
+        if subject_key(rest) in EMPTY_PAIRS:
             header = f"<b>{pair_num} пара ({time_str})</b>" if time_str else f"<b>{pair_num} пара</b>"
-            blocks.append(f"{header}\n⏸ Окно / нет пары")
+            blocks.append(f"{header}\n❌ Пропуск")
             continue
 
         room_str = None
