@@ -328,7 +328,11 @@ class TopicInterfaceTests(RouterCase):
 
     async def test_student_navigation_is_private_for_two_concurrent_users(self):
         storage.bind_topic(-1007, 2, 42)
-        storage.save_schedule("2026-11-16", "published", "<b>1 пара (08:30 – 10:05)</b>\n🧪 Химия\n📍 Каб. 6")
+        storage.save_schedule(
+            "2026-11-16", "published",
+            "<b>1 пара (08:30 – 10:05)</b>\n🧪 Химия\n📍 Каб. 6\n\n"
+            "<b>2 пара (10:35 – 12:10)</b>\n📚 История",
+        )
         await asyncio.gather(*(self.open("schedule", user_id=user, message_id=42) for user in (98, 99)))
         sends = [call for call in self.session.calls if type(call).__name__ == "SendMessage"]
         self.assertEqual({call.ephemeral_message_parameters.receiver_user_id for call in sends}, {98, 99})
@@ -342,9 +346,10 @@ class TopicInterfaceTests(RouterCase):
         edits = [call for call in self.session.calls if type(call).__name__ == "EditEphemeralMessageText"]
         self.assertEqual({(call.receiver_user_id, call.ephemeral_message_id) for call in edits}, {(98, 101), (99, 102)})
         today = next(call for call in edits if call.receiver_user_id == 98)
-        self.assertIn("1️⃣ 08:30–10:05", today.rich_message.html)
-        self.assertIn("Кабинет 6", today.rich_message.html)
-        self.assertIn("пока не опубликовано", next(call for call in edits if call.receiver_user_id == 99).rich_message.html)
+        self.assertEqual(today.parse_mode, "HTML")
+        self.assertIn("1️⃣ 08:30–10:05", today.text)
+        self.assertIn("Кабинет 6\n\n<b>2️⃣", today.text)
+        self.assertIn("пока не опубликовано", next(call for call in edits if call.receiver_user_id == 99).text)
         await self.open("main", user_id=98, ephemeral_id=101)
         self.assertIn("ПИЩЕБЛОК-200", self.session.calls[-2].text)
         self.assertNotIn("EditMessageText", self.methods())
@@ -353,9 +358,10 @@ class TopicInterfaceTests(RouterCase):
     async def test_expired_screen_is_replaced_for_same_student(self):
         storage.bind_topic(-1007, 2, 42)
         self.session.failed_methods["EditEphemeralMessageText"] = "message to edit not found"
-        await self.open("hw", user_id=99, ephemeral_id=101)
+        await self.open("hw", user_id=99, ephemeral_id=87)
         self.assertEqual(self.methods(), ["EditEphemeralMessageText", "SendMessage", "DeleteEphemeralMessage", "AnswerCallbackQuery"])
         self.assertEqual(self.session.calls[1].ephemeral_message_parameters.receiver_user_id, 99)
+        self.assertEqual(self.session.calls[2].ephemeral_message_id, 87)
         self.assertIn("Раздел в разработке", self.session.calls[1].text)
 
     async def test_stale_or_foreign_buttons_only_get_private_alerts(self):
@@ -365,20 +371,44 @@ class TopicInterfaceTests(RouterCase):
         self.assertEqual(self.methods(), ["AnswerCallbackQuery", "AnswerCallbackQuery"])
         self.assertTrue(all(call.show_alert for call in self.session.calls))
 
-    async def test_rich_fallback_and_total_send_failure(self):
+    async def test_temporary_send_failure_uses_private_alert(self):
         storage.bind_topic(-1007, 2, 42)
         storage.save_schedule("2026-11-16", "holiday")
-        self.session.failed_methods["SendRichMessage"] = "unsupported"
         await self.open("today", user_id=99, message_id=42)
-        self.assertEqual(self.methods(), ["SendRichMessage", "SendMessage", "AnswerCallbackQuery"])
-        self.assertIn("Выходной", self.session.calls[1].text)
-        self.assertEqual(self.session.calls[1].ephemeral_message_parameters.receiver_user_id, 99)
+        self.assertEqual(self.methods(), ["SendMessage", "AnswerCallbackQuery"])
+        self.assertIn("Выходной", self.session.calls[0].text)
+        self.assertEqual(self.session.calls[0].ephemeral_message_parameters.receiver_user_id, 99)
         self.session.calls.clear()
+        self.session.failed_methods["EditEphemeralMessageText"] = "message to edit not found"
         self.session.failed_methods["SendMessage"] = "unsupported"
         await self.open("today", user_id=99, message_id=42)
         self.assertTrue(self.session.calls[-1].show_alert)
         self.assertIn("Выходной", self.session.calls[-1].text)
         self.assertLessEqual(schedule.telegram_length(self.session.calls[-1].text), 200)
+
+    async def test_repeated_pin_click_reuses_saved_screen_and_cleans_legacy_duplicate(self):
+        storage.bind_topic(-1007, 2, 42)
+        await self.open("schedule", user_id=99, message_id=42)
+        storage.init_db()
+        self.session.calls.clear()
+        await self.open("hw", user_id=99, message_id=42)
+        self.assertEqual(self.methods(), ["EditEphemeralMessageText", "AnswerCallbackQuery"])
+        self.assertEqual(self.session.calls[0].ephemeral_message_id, 101)
+        self.session.calls.clear()
+        await self.open("main", user_id=99, ephemeral_id=88)
+        self.assertEqual(self.methods(), ["EditEphemeralMessageText", "DeleteEphemeralMessage", "AnswerCallbackQuery"])
+        self.assertEqual(self.session.calls[0].ephemeral_message_id, 101)
+        self.assertEqual(self.session.calls[1].ephemeral_message_id, 88)
+
+    async def test_quick_view_uses_a_single_readable_row_per_class(self):
+        storage.save_schedule(
+            "2026-11-16", "published",
+            "<b>1 пара (08:30 – 10:05)</b>\n🧪 Химия\n📍 Каб. 6\n\n"
+            "<b>2 пара (10:35 – 12:10)</b>\n📚 История",
+        )
+        await self.feed(action="quick:today", group=True, user_id=99)
+        self.assertEqual(self.methods(), ["AnswerCallbackQuery"])
+        self.assertEqual(self.session.calls[0].text, "📅 Сегодня · 16.11\n\n08:30 · Химия · Каб. 6\n10:35 · История")
 
     async def test_photo_and_back_to_main_after_reopening_db(self):
         storage.bind_topic(-1007, 2, 42)

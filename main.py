@@ -289,37 +289,45 @@ def build_compact_alert_text(day_key: str) -> str:
     dt = get_target_date(day_key)
     date_str = dt.strftime("%Y-%m-%d")
     row = get_schedule(date_str)
-    title = f"📅 {format_date_human(date_str)}:"
+    title = f"📅 {'Сегодня' if day_key == 'today' else 'Завтра'} · {dt:%d.%m}"
 
     if not row:
-        return f"{title}\n⏳ Расписание пока не опубликовано."
-    status, content, _, _, _, _, _ = row
+        return f"{title}\n\n⏳ Расписание пока не опубликовано."
+    status, content, _, photo, _, _, _ = row
     if status == "holiday":
-        return f"{title}\n🏖 Выходной / занятий нет."
+        return f"{title}\n\n🏖 Выходной · занятий нет"
     if not content:
-        return f"{title}\n📸 Расписание только на фото — открой бота в ЛС."
+        detail = "📸 Расписание только на фото. Открой «Расписание»." if photo else "⏳ Текст расписания отсутствует."
+        return f"{title}\n\n{detail}"
 
     clean = ScheduleHTML(content).plain_text()
-    blocks = [b.strip() for b in clean.split("\n\n") if b.strip()]
-    lines = [title]
-    for b in blocks:
-        b_lines = [l.strip() for l in b.splitlines() if l.strip()]
-        if b_lines[0].startswith("💬"):
-            lines.append(b_lines[0])
+    lines = []
+    for block in clean.split("\n\n"):
+        parts = [line.strip() for line in block.splitlines() if line.strip()]
+        if not parts:
             continue
-        if b_lines[0].startswith("Классный час"):
-            lines.append("🏫 08:30 Кл. час")
+        heading = parts[0]
+        if heading.startswith("Классный час"):
+            time = re.search(r"\d\d:\d\d", heading)
+            lines.append(f"{time[0]} · Классный час" if time else heading)
             continue
-        m_p = re.match(r"(\d+)\s*пара\s*\((\d{2}:\d{2})", b_lines[0])
-        num_t = f"{m_p.group(1)}) {m_p.group(2)}" if m_p else b_lines[0]
-        subj = b_lines[1] if len(b_lines) > 1 else ""
-        subj_short = re.sub(r"^[^\wА-Яа-яЁё]+", "", subj).strip()
-        cab = ""
-        if len(b_lines) > 2:
-            cab = " (" + b_lines[2].replace("📍", "").replace("Каб.", "к.").strip() + ")"
-        lines.append(f"{num_t} {subj_short}{cab}")
+        pair = re.match(r"(\d+)\s+пара(?:\s*\((\d\d:\d\d))?", heading)
+        if not pair or len(parts) < 2:
+            lines.append(truncate_plain(heading, 48))
+            continue
+        label = pair[2] or f"{pair[1]} пара"
+        subject = re.sub(r"^[^\w]+", "", parts[1]).strip() or parts[1]
+        room = f" · {parts[2].removeprefix('📍').strip()}" if len(parts) > 2 else ""
+        lines.append(truncate_plain(f"{label} · {subject}{room}", 52))
 
-    return truncate_plain("\n".join(lines), ALERT_LIMIT, "\n…полное в ЛС бота")
+    prefix = title + "\n\n"
+    full = prefix + "\n".join(lines)
+    if telegram_length(full) <= ALERT_LIMIT:
+        return full
+    footer = "\n\n… Полное — в «Расписании»"
+    while telegram_length(prefix + "\n".join(lines) + footer) > ALERT_LIMIT:
+        lines.pop()
+    return prefix + "\n".join(lines) + footer
 
 
 # --- ПУБЛИКАЦИЯ В ТЕМУ СУПЕРГРУППЫ ---

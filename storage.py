@@ -78,6 +78,16 @@ def init_db():
                 room TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS topic_screens (
+                chat_id INTEGER NOT NULL,
+                thread_key INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                ephemeral_id INTEGER NOT NULL,
+                has_photo INTEGER NOT NULL,
+                PRIMARY KEY (chat_id, thread_key, user_id)
+            )
+        """)
         for k, v in DEFAULT_TIMINGS.items():
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
         conn.commit()
@@ -153,6 +163,26 @@ def bind_topic(chat_id: int, thread_id: int | None, menu_id: int):
                 ("topic_menu_msg_id", menu_id),
             )],
         )
+
+
+def get_topic_screen(chat_id: int, thread_key: int, user_id: int) -> tuple[int, bool] | None:
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT ephemeral_id, has_photo FROM topic_screens WHERE chat_id=? AND thread_key=? AND user_id=?",
+            (chat_id, thread_key, user_id),
+        ).fetchone()
+    return (row[0], bool(row[1])) if row else None
+
+
+def save_topic_screen(chat_id: int, thread_key: int, user_id: int, ephemeral_id: int, has_photo: bool):
+    with connection() as conn:
+        conn.execute("""
+            INSERT INTO topic_screens (chat_id, thread_key, user_id, ephemeral_id, has_photo)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id, thread_key, user_id) DO UPDATE SET
+                ephemeral_id=excluded.ephemeral_id,
+                has_photo=excluded.has_photo
+        """, (chat_id, thread_key, user_id, ephemeral_id, has_photo))
 
 
 def set_topic_message(date_str: str, message_id: int):
