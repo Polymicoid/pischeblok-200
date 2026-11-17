@@ -12,15 +12,15 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.methods import GetUpdates
 from aiogram.types import (
     CallbackQuery, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup,
-    InlineQuery, InlineQueryResultArticle, InputMediaPhoto, InputTextMessageContent, Message,
+    InputMediaPhoto, Message,
 )
 
 import storage
 import group_interface
 from config import ConfigError, load_config
 from schedule import (
-    ScheduleHTML, format_date_human, format_day_btn, format_schedule_blocks,
-    format_updated_human, get_now, get_target_date, refresh_subject_emojis, telegram_length,
+    ScheduleHTML, build_schedule_view, format_post_body, format_date_human, format_day_btn, format_schedule_blocks,
+    get_now, get_target_date, telegram_length,
 )
 from storage import (
     bind_topic, clear_subject_rooms, delete_schedule, get_all_subject_rooms,
@@ -57,7 +57,7 @@ class AdminCallbacks(BaseMiddleware):
                 if event.message.message_id != draft.get("menu_msg_id"):
                     await event.answer("Кнопка устарела. Открой панель заново через /start.", show_alert=True)
                     return
-            action = re.fullmatch(r"admin:(day|edit|push|holiday|clear):(today|tomorrow)(?::([0-9-]+))?", key)
+            action = re.fullmatch(r"admin:(day|edit|holiday|clear):(today|tomorrow)(?::([0-9-]+))?", key)
             if action:
                 _, day, date = action.groups()
                 if date != get_target_date(day).date().isoformat():
@@ -203,15 +203,12 @@ def kb_admin_rooms(has_rooms: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def kb_admin_day(day_key: str, has_schedule: bool, has_topic: bool) -> InlineKeyboardMarkup:
+def kb_admin_day(day_key: str, has_schedule: bool) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="✏️ Ввести / Изменить расписание", callback_data=admin_day_action("edit", day_key))],
         [InlineKeyboardButton(text="🏖 Поставить «Выходной / занятий нет»", callback_data=admin_day_action("holiday", day_key))],
     ]
-    if has_schedule and has_topic:
-        rows.append([InlineKeyboardButton(text="📤 Отправить в тему (новым сообщением)", callback_data=admin_day_action("push", day_key))])
     if has_schedule:
-        rows.append([InlineKeyboardButton(text="📲 Переслать в другой чат (Inline)", switch_inline_query=day_key)])
         rows.append([InlineKeyboardButton(text="🗑 Сбросить («Не опубликовано»)", callback_data=admin_day_action("clear", day_key))])
     rows.append([InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -249,41 +246,6 @@ def kb_admin_preview(day_key: str, has_topic: bool) -> InlineKeyboardMarkup:
 MAIN_MENU_TEXT = group_interface.MENU
 
 
-def format_post_body(date_str: str, status: str, content: str | None, updated_at: str = None) -> str:
-    date_human = format_date_human(date_str)
-    header = f"📅 <b>Расписание на {date_human}</b>"
-
-    if status == "holiday":
-        body = f"{header}\n\n🏖 <b>Выходной / занятий нет.</b>"
-    elif content:
-        body = f"{header}\n\n{refresh_subject_emojis(content)}"
-    else:
-        body = header
-
-    if updated_at:
-        upd_human = format_updated_human(updated_at)
-        body += f"\n\n🕒 Обновлено: {html.escape(upd_human)}"
-    return body
-
-
-def build_schedule_view(day_key: str) -> tuple[str, str | None, bool]:
-    dt = get_target_date(day_key)
-    date_str = dt.strftime("%Y-%m-%d")
-    row = get_schedule(date_str)
-
-    if not row:
-        date_human = format_date_human(date_str)
-        return (
-            f"📅 <b>Расписание на {date_human}</b>\n\n"
-            f"⏳ <i>Расписание пока не опубликовано.</i>",
-            None,
-            False,
-        )
-
-    status, content, updated_at, photo_id, _, _, _ = row
-    return format_post_body(date_str, status, content, updated_at), photo_id, True
-
-
 # --- ПУБЛИКАЦИЯ В ТЕМУ СУПЕРГРУППЫ ---
 async def sync_schedule_to_topic(
     bot: Bot,
@@ -292,20 +254,18 @@ async def sync_schedule_to_topic(
     content: str | None,
     photo_id: str | None,
     old_topic_msg_id: int | None,
-    updated_at: str = None,
-    force_new: bool = False,
 ) -> tuple[int | None, str | None]:
     chat_id, thread_id = get_topic_config()
     if not chat_id:
         return None, "Тема группы не привязана (/set_topic)."
 
-    upd = updated_at or get_now().strftime("%Y-%m-%d %H:%M")
+    upd = get_now().strftime("%Y-%m-%d %H:%M")
     post_text = ScheduleHTML(format_post_body(date_str, status, content, upd)).limited(
         CAPTION_LIMIT if photo_id else MESSAGE_LIMIT,
     )
 
     try:
-        if old_topic_msg_id and not force_new:
+        if old_topic_msg_id:
             try:
                 if photo_id:
                     await bot.edit_message_media(
@@ -344,7 +304,7 @@ async def sync_schedule_to_topic(
             )
             log("📢 Тема группы", f"отправлен НОВЫЙ пост за {date_str} (msg #{sent.message_id})")
         set_topic_message(date_str, sent.message_id)
-        if old_topic_msg_id and not force_new:
+        if old_topic_msg_id:
             try:
                 await bot.delete_message(chat_id=chat_id, message_id=old_topic_msg_id)
             except TelegramAPIError as error:
@@ -461,35 +421,6 @@ async def cb_topic_screen(callback: CallbackQuery, bot: Bot):
         )
     else:
         await callback.answer()
-
-
-@router.inline_query()
-async def inline_schedule(query: InlineQuery):
-    results = []
-    for day_key, title in [("today", "📅 Расписание на сегодня"), ("tomorrow", "➡️ Расписание на завтра")]:
-        text, _, has_sched = build_schedule_view(day_key)
-        if not has_sched:
-            continue
-        results.append(
-            InlineQueryResultArticle(
-                id=day_key,
-                title=title,
-                description="Нажми, чтобы отправить расписание в этот чат",
-                input_message_content=InputTextMessageContent(message_text=ScheduleHTML(text).limited(MESSAGE_LIMIT), parse_mode="HTML"),
-            )
-        )
-    if not results:
-        results.append(
-            InlineQueryResultArticle(
-                id="empty",
-                title="⏳ Расписание ещё не опубликовано",
-                description="Пока нет актуальных данных",
-                input_message_content=InputTextMessageContent(
-                    message_text="⏳ Расписание пока не опубликовано.", parse_mode="HTML"
-                ),
-            )
-        )
-    await query.answer(results, cache_time=5, is_personal=False)
 
 
 # --- ЛИЧНЫЕ СООБЩЕНИЯ ---
@@ -696,31 +627,10 @@ async def cb_admin_day(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     day_key = callback.data.split(":")[2]
     current_text, photo_id, has_sched = build_schedule_view(day_key)
-    chat_id, _ = get_topic_config()
 
     text = f"⚙️ <b>Управление расписанием</b>\n\nСейчас студенты видят:\n— — — — —\n{current_text}"
-    await render_screen(callback.message, text, kb_admin_day(day_key, has_sched, bool(chat_id)), photo_id=photo_id)
+    await render_screen(callback.message, text, kb_admin_day(day_key, has_sched), photo_id=photo_id)
     await callback.answer()
-
-
-@router.callback_query(F.data.regexp(r"^admin:push:(today|tomorrow)(?::[0-9-]+)?$"))
-async def cb_admin_push_topic(callback: CallbackQuery, bot: Bot):
-    if not is_admin(callback.from_user.id):
-        return
-    date_str = callback.data.rsplit(":", 1)[-1]
-    row = get_schedule(date_str)
-    if not row:
-        await callback.answer("Сначала добавь расписание.", show_alert=True)
-        return
-
-    status, content, updated_at, photo_id, old_topic_msg_id, _, _ = row
-    _, err = await sync_schedule_to_topic(
-        bot, date_str, status, content, photo_id, old_topic_msg_id, updated_at, force_new=True
-    )
-    if err:
-        await callback.answer(f"❌ {err[:180]}", show_alert=True)
-    else:
-        await callback.answer("✅ Отправлено новым сообщением в тему группы!", show_alert=True)
 
 
 @router.callback_query(F.data.regexp(r"^admin:holiday:(today|tomorrow)(?::[0-9-]+)?$"))
@@ -742,11 +652,10 @@ async def cb_admin_holiday(callback: CallbackQuery, bot: Bot):
         await callback.answer("🏖 Установлен статус «Выходной / занятий нет»", show_alert=True)
 
     current_text, _, has_sched = build_schedule_view(day_key)
-    chat_id, _ = get_topic_config()
     await render_screen(
         callback.message,
         f"⚙️ <b>Управление расписанием</b>\n\nСейчас студенты видят:\n— — — — —\n{current_text}",
-        kb_admin_day(day_key, has_sched, bool(chat_id)),
+        kb_admin_day(day_key, has_sched),
     )
 
 
@@ -774,11 +683,10 @@ async def cb_admin_clear(callback: CallbackQuery, bot: Bot):
     await callback.answer("🗑 Расписание сброшено" + topic_warning, show_alert=True)
 
     current_text, _, has_sched = build_schedule_view(day_key)
-    chat_id, _ = get_topic_config()
     await render_screen(
         callback.message,
         f"⚙️ <b>Управление расписанием</b>\n\nСейчас студенты видят:\n— — — — —\n{current_text}",
-        kb_admin_day(day_key, has_sched, bool(chat_id)),
+        kb_admin_day(day_key, has_sched),
     )
 
 
@@ -1015,11 +923,10 @@ async def cb_admin_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot)
         await callback.answer("✅ Опубликовано только в боте!", show_alert=True)
 
     current_text, current_photo, has_sched = build_schedule_view(day_key)
-    chat_id, _ = get_topic_config()
     await render_screen(
         callback.message,
         f"⚙️ <b>Управление расписанием</b>\n\nСейчас студенты видят:\n— — — — —\n{current_text}",
-        kb_admin_day(day_key, has_sched, bool(chat_id)),
+        kb_admin_day(day_key, has_sched),
         photo_id=current_photo,
     )
 

@@ -107,12 +107,38 @@ SUBJECT_EMOJIS = {
     "информатика": "💻",
     "география": "🌍",
     "микробиология": "🔬", "микробио": "🔬",
+    "иностранный язык": "🌐",
 }
 EMPTY_PAIRS = {"-", "–", "—", "окно", "нет", "нет пары", "свободно", "пропуск", "пропуски", "окно / нет пары"}
+FOREIGN_LANGUAGE = "Иностранный язык"
+FOREIGN_ROOMS = "Немецкий — каб. 13 · Английский — каб. 17"
+SUBJECT_NAMES = {
+    "матан": "Математика",
+    "общество": "Обществознание",
+    "физра": "Физическая культура",
+    "физкультура": "Физическая культура",
+    "обзр": "Основы безопасности и защиты Родины",
+    "оид": "Основы исследовательской деятельности",
+    "микробио": "Микробиология",
+    **dict.fromkeys((
+        "иностранный", "иностранный язык", "ин яз", "ин. яз.", "иняз",
+        "английский", "английский язык", "англ", "англ.",
+        "немецкий", "немецкий язык", "нем", "нем.",
+    ), FOREIGN_LANGUAGE),
+}
 
 
 def subject_key(subject: str) -> str:
     return " ".join(subject.casefold().strip().removeprefix("#").replace("_", " ").split())
+
+
+def normalize_subject(subject: str) -> str:
+    key = subject_key(subject)
+    if key in SUBJECT_NAMES:
+        return SUBJECT_NAMES[key]
+    if key in SUBJECT_EMOJIS:
+        return key.capitalize()
+    return subject[:1].upper() + subject[1:]
 
 
 def pick_subject_emoji(subject: str) -> str:
@@ -141,15 +167,24 @@ def pick_subject_emoji(subject: str) -> str:
     return "📚"
 
 
-def refresh_subject_emojis(content: str) -> str:
-    """Обновляет значки в сохранённых блоках пар, сохраняя текст и HTML."""
+def refresh_subjects(content: str) -> str:
+    """Применяет текущие названия к сохранённым блокам без записи в SQLite."""
     def replace(match: re.Match) -> str:
-        heading, old_emoji, subject = match.groups()
-        key = subject_key(html.unescape(subject))
+        heading, old_emoji, old_subject, room = match.groups()
+        key = subject_key(html.unescape(old_subject))
+        if key in SUBJECT_NAMES or key in SUBJECT_EMOJIS:
+            subject = normalize_subject(html.unescape(old_subject))
+            old_subject = html.escape(subject)
+            key = subject_key(subject)
+            if subject == FOREIGN_LANGUAGE:
+                room = f"\n📍 {FOREIGN_ROOMS}"
         emoji = "❌" if key in EMPTY_PAIRS else SUBJECT_EMOJIS.get(key, old_emoji)
-        return f"{heading}{emoji} {subject}"
+        return f"{heading}{emoji} {old_subject}{room or ''}"
 
-    return re.sub(r"(?m)^(<b>\d+ пара(?: \([^\n]*\))?</b>\n)([^\w\s]+) ([^\n]+)$", replace, content)
+    return re.sub(
+        r"(?m)^(<b>\d+ пара(?: \([^\n]*\))?</b>\n)([^\w\s]+) ([^\n]+)(\n📍 [^\n]+)?$",
+        replace, content,
+    )
 
 
 def format_schedule_blocks(raw_text: str, date_str: str, has_class_hour: bool) -> tuple[str, list[tuple[str, str]]]:
@@ -224,14 +259,18 @@ def format_schedule_blocks(raw_text: str, date_str: str, has_class_hour: bool) -
             else:
                 subj = rest.strip()
 
-        subj = subj[0].upper() + subj[1:] if subj else ""
-
-        if room_str:
+        original_subject = subj
+        subj = normalize_subject(subj)
+        if subj == FOREIGN_LANGUAGE:
+            room_str = FOREIGN_ROOMS
+        elif room_str:
             learned_rooms.append((subj, room_str))
         else:
-            remembered = get_saved_room(subj)
-            if remembered:
-                room_str = remembered
+            room_str = get_saved_room(subj) or get_saved_room(original_subject)
+            if not room_str:
+                for alias, name in SUBJECT_NAMES.items():
+                    if name == subj and (room_str := get_saved_room(alias)):
+                        break
 
         emoji = pick_subject_emoji(subj)
         header = f"<b>{pair_num} пара ({time_str})</b>" if time_str else f"<b>{pair_num} пара</b>"
@@ -300,3 +339,40 @@ class ScheduleHTML(HTMLParser):
         if telegram_length(plain) <= limit:
             return "".join(self.parts)
         return html.escape(truncate_plain(plain, limit, suffix), quote=False)
+
+
+def format_post_body(date_str: str, status: str, content: str | None, updated_at: str = None) -> str:
+    date_human = format_date_human(date_str)
+    header = f"📅 <b>Расписание на {date_human}</b>"
+
+    if status == "holiday":
+        body = f"{header}\n\n🏖 <b>Выходной / занятий нет.</b>"
+    elif content:
+        body = f"{header}\n\n{refresh_subjects(content)}"
+    else:
+        body = header
+
+    if updated_at:
+        upd_human = format_updated_human(updated_at)
+        body += f"\n\n🕒 Обновлено: {html.escape(upd_human)}"
+    return body
+
+
+def build_schedule_view(day_key: str) -> tuple[str, str | None, bool]:
+    from storage import get_schedule
+
+    dt = get_target_date(day_key)
+    date_str = dt.strftime("%Y-%m-%d")
+    row = get_schedule(date_str)
+
+    if not row:
+        date_human = format_date_human(date_str)
+        return (
+            f"📅 <b>Расписание на {date_human}</b>\n\n"
+            f"⏳ <i>Расписание пока не опубликовано.</i>",
+            None,
+            False,
+        )
+
+    status, content, updated_at, photo_id, _, _, _ = row
+    return format_post_body(date_str, status, content, updated_at), photo_id, True

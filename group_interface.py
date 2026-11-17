@@ -1,6 +1,3 @@
-import html
-import re
-
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramNotFound
 from aiogram.types import (
@@ -8,11 +5,10 @@ from aiogram.types import (
     InlineKeyboardMarkup, InputMediaPhoto, Message,
 )
 
-from schedule import (
-    MONTHS_GEN, ScheduleHTML, format_day_btn, format_updated_human,
-    get_target_date, refresh_subject_emojis, telegram_length,
-)
-from storage import get_schedule, get_topic_screen, save_topic_screen
+from schedule import ScheduleHTML, build_schedule_view, format_day_btn, telegram_length
+from storage import get_topic_screen, save_topic_screen
+
+
 
 BRAND = "👹 ПИЩЕБЛОК-200 | Учебный помощник"
 MENU = f"<b>{BRAND}</b>\n\n🍳 Для группы ПКД-1. Выбери нужный раздел:"
@@ -22,8 +18,6 @@ SECTIONS = {
     "books": ("📖 Учебники и методички", "Здесь будут учебники, методички и ссылки на материалы."),
     "news": ("📢 Объявления", "Здесь будут важные новости группы и изменения в учебных планах."),
 }
-WEEKDAYS = ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье")
-PAIR_ICONS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟")
 DAYS = {"today", "tomorrow"}
 SCREENS = {"main", "schedule", *DAYS, *SECTIONS}
 
@@ -45,35 +39,6 @@ def menu_keyboard(username: str, *, pinned: bool = False) -> InlineKeyboardMarku
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def schedule_screen(day: str) -> tuple[str, str | None]:
-    target = get_target_date(day).date()
-    row = get_schedule(target.isoformat())
-    header = f"📅 <b>{WEEKDAYS[target.weekday()].upper()}, {target.day} {MONTHS_GEN[target.month].upper()}</b>"
-    if not row:
-        return f"{header}\n\n⏳ <i>Расписание пока не опубликовано</i>", None
-
-    status, content, updated, photo, *_ = row
-    if status == "holiday":
-        body = "🏖 <b>Выходной / занятий нет</b>"
-    else:
-        body = refresh_subject_emojis(content) if content else (
-            "📸 Расписание на фото" if photo else "⏳ Текст расписания отсутствует"
-        )
-
-        def pair_heading(match: re.Match) -> str:
-            number = int(match[1])
-            label = PAIR_ICONS[number - 1] if 1 <= number <= len(PAIR_ICONS) else f"{number}."
-            timing = re.sub(r"\s*–\s*", "–", match[2])
-            return f"<b>{label} {timing}</b>"
-
-        body = re.sub(r"\n+(?=<b>\d+ пара\b)", "\n\n", body)
-        body = re.sub(r"(?m)^<b>(\d+) пара \((\d\d:\d\d\s*–\s*\d\d:\d\d)\)</b>$", pair_heading, body)
-        body = body.replace("📍 Каб. ", "📍 Кабинет ")
-
-    footer = f"\n\n🕒 Обновлено: {html.escape(format_updated_human(updated))}" if updated else ""
-    return f"{header}\n\n{body}{footer}", photo
-
-
 def render(screen: str, username: str) -> tuple[str, str | None, InlineKeyboardMarkup]:
     if screen == "main":
         return MENU, None, menu_keyboard(username)
@@ -84,7 +49,7 @@ def render(screen: str, username: str) -> tuple[str, str | None, InlineKeyboardM
 
     rows = [[button(format_day_btn("today"), "today"), button(format_day_btn("tomorrow"), "tomorrow")]]
     if screen in DAYS:
-        text, photo = schedule_screen(screen)
+        text, photo, _ = build_schedule_view(screen)
         rows.append([button("🔄 Обновить", screen), button("⬅️ К расписанию", "schedule")])
     else:
         text, photo = "📅 <b>Расписание</b>\n\nВыбери день.", None

@@ -95,14 +95,33 @@ class ScheduleTests(DatabaseCase, unittest.TestCase):
             "Пропуск\nНет пары\n—\n09:05–10:40 #Матан 12", "2026-11-16", False,
         )
         self.assertEqual(formatted.count("❌ Пропуск"), 3)
-        self.assertIn("📐 #Матан\n📍 Каб. 12", formatted)
-        self.assertEqual(rooms, [("#Матан", "Каб. 12")])
+        self.assertIn("📐 Математика\n📍 Каб. 12", formatted)
+        self.assertEqual(rooms, [("Математика", "Каб. 12")])
         legacy = "<b>1 пара (08:30 – 10:05)</b>\n📚 География\n📍 Каб. 3\n\n<b>2 пара</b>\n⏸ Окно / нет пары"
         storage.save_schedule("2026-11-16", "published", legacy)
-        for view in (main.build_schedule_view, main.group_interface.schedule_screen):
+        for view in (main.build_schedule_view, lambda day: main.group_interface.render(day, "test_bot")):
             text = view("today")[0]
             self.assertIn("🌍 География", text)
             self.assertIn("❌ Окно / нет пары", text)
+        self.assertEqual(storage.get_schedule("2026-11-16")[1], legacy)
+
+    def test_normalizes_aliases_and_shared_foreign_language_rooms(self):
+        legacy = (
+            "<b>1 пара (08:30 – 10:05)</b>\n📐 Матан\n📍 Каб. 8\n\n"
+            "<b>2 пара (10:35 – 12:10)</b>\n🇩🇪 Немецкий язык\n📍 Каб. 13"
+        )
+        storage.save_schedule("2026-11-16", "published", legacy, learned_rooms=(("Матан", "Каб. 8"),))
+        for name in ("Иностранный язык", "Английский 17", "#немецкий_язык 13"):
+            text, rooms = schedule.format_schedule_blocks(f"матан\nфизра\n{name}", "2026-11-16", False)
+            self.assertIn("📐 Математика\n📍 Каб. 8", text)
+            self.assertIn("⚽ Физическая культура", text)
+            self.assertIn("🌐 Иностранный язык\n📍 Немецкий — каб. 13 · Английский — каб. 17", text)
+            self.assertEqual(rooms, [])
+            self.assertEqual(schedule.refresh_subjects(text), text)
+        view = main.group_interface.render("today", "test_bot")[0]
+        self.assertEqual(view, main.build_schedule_view("today")[0])
+        self.assertIn("<b>1 пара (08:30 – 10:05)</b>\n📐 Математика", view)
+        self.assertIn("🌐 Иностранный язык\n📍 Немецкий — каб. 13 · Английский — каб. 17", view)
         self.assertEqual(storage.get_schedule("2026-11-16")[1], legacy)
 
     def test_schedule_statuses(self):
@@ -209,7 +228,7 @@ class RouterCase(DatabaseCase, unittest.IsolatedAsyncioTestCase):
 
     async def feed(
         self, *, action=None, text=None, user_id=11, message_id=10, group=False,
-        photo=False, inline=False, thread_id=None, ephemeral_id=None, receiver_id=None,
+        photo=False, thread_id=None, ephemeral_id=None, receiver_id=None,
         callback_id=None, chat_id=-1007,
     ):
         user = {"id": user_id, "is_bot": False, "first_name": "Тест"}
@@ -230,8 +249,6 @@ class RouterCase(DatabaseCase, unittest.IsolatedAsyncioTestCase):
                 "id": callback_id or str(user_id), "from": user, "chat_instance": "test",
                 "data": action, "message": message,
             }
-        elif inline:
-            update["inline_query"] = {"id": "1", "from": user, "query": "", "offset": ""}
         elif photo:
             update["message"] = {
                 **message, "from": user, "caption": text,
@@ -276,7 +293,10 @@ class RouterTests(RouterCase):
         self.assertIsNone(row[4])
         self.assertEqual(storage.get_saved_room("Биология"), "Каб. 12")
         self.session.fail_post = False
-        await self.feed(action="admin:push:today:2026-11-16")
+        await self.feed(action="admin:edit:today:2026-11-16")
+        await self.feed(action="admin:ch:yes")
+        await self.feed(text="1. Биология 12", message_id=11)
+        await self.feed(action="admin:confirm:topic", message_id=self.session.message_id)
         self.assertGreater(storage.get_schedule("2026-11-16")[4], 0)
 
     async def test_photo_to_text_replacement_preserves_old_on_failure(self):
@@ -302,12 +322,15 @@ class RouterTests(RouterCase):
         row = storage.get_schedule("2026-11-17")
         self.assertEqual((row[0], row[1], row[3]), ("published", None, "photo"))
 
-    async def test_inline_sends_schedule_text(self):
+    async def test_admin_day_menu_omits_removed_actions(self):
         storage.save_schedule("2026-11-16", "published", "<b>Биология</b>")
-        await self.feed(inline=True, user_id=99)
-        self.assertEqual(type(self.session.calls[-1]).__name__, "AnswerInlineQuery")
-        article = self.session.calls[-1].results[0]
-        self.assertIn("<b>Биология</b>", article.input_message_content.message_text)
+        await self.feed(action="admin:day:today:2026-11-16")
+        buttons = self.session.calls[0].reply_markup.inline_keyboard
+        self.assertEqual(len(buttons), 4)
+        self.assertTrue(all(button[0].callback_data for button in buttons))
+        self.session.calls.clear()
+        await self.feed(action="admin:push:today:2026-11-16")
+        self.assertEqual([type(call).__name__ for call in self.session.calls], ["AnswerCallbackQuery"])
 
 
 class TopicInterfaceTests(RouterCase):
@@ -378,8 +401,8 @@ class TopicInterfaceTests(RouterCase):
         self.assertEqual({(call.receiver_user_id, call.ephemeral_message_id) for call in edits}, {(98, 101), (99, 102)})
         today = next(call for call in edits if call.receiver_user_id == 98)
         self.assertEqual(today.parse_mode, "HTML")
-        self.assertIn("1️⃣ 08:30–10:05", today.text)
-        self.assertIn("Кабинет 6\n\n<b>2️⃣", today.text)
+        self.assertIn("<b>1 пара (08:30 – 10:05)</b>", today.text)
+        self.assertIn("Каб. 6\n\n<b>2 пара", today.text)
         self.assertIn("пока не опубликовано", next(call for call in edits if call.receiver_user_id == 99).text)
         await self.open("main", user_id=98, ephemeral_id=101)
         self.assertIn("ПИЩЕБЛОК-200", self.session.calls[-2].text)
