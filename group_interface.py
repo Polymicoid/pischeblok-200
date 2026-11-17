@@ -93,9 +93,10 @@ async def close_screen(bot: Bot, message: Message, user_id: int, thread_id: int 
 
 def photo_message(text: str, photo: str) -> InputRichMessage:
     # Встроенное фото можно убрать следующей правкой того же временного сообщения.
-    paragraphs = text.replace("\n\n", "</p><p>").replace("\n", "<br>")
+    # Клиент сжимает отступы абзацев, поэтому пустая строка задаётся явно.
+    lines = text.replace("\n\n", "<br>&#160;<br>").replace("\n", "<br>")
     return InputRichMessage(
-        html=f'<img src="tg://photo?id=schedule-photo"/><p>{paragraphs}</p>',
+        html=f'<img src="tg://photo?id=schedule-photo"/><p>{lines}</p>',
         media=[InputRichMessageMedia(id="schedule-photo", media=InputMediaPhoto(media=photo))],
         skip_entity_detection=True,
     )
