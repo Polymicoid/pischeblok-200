@@ -345,6 +345,8 @@ class TopicInterfaceTests(RouterCase):
         self.assertEqual(self.methods(), ["DeleteMessage", "SendMessage", "PinChatMessage", "SendMessage"])
         menu = self.session.calls[1]
         self.assertIn("ПИЩЕБЛОК-200", menu.text)
+        self.assertIn("<i>Учебный штаб группы ПКД-1</i>", menu.text)
+        self.assertIn("<b>Наша задача: дожить до диплома и ничего не забыть.</b>", menu.text)
         self.assertNotIn("ЛЧПП", menu.text)
         self.assertEqual(menu.reply_markup.inline_keyboard[0][0].callback_data, "topic:schedule")
         self.assertTrue(all(

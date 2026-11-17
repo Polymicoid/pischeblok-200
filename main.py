@@ -345,7 +345,7 @@ async def cmd_set_topic(message: Message, bot: Bot):
     menu_id = None
     new_menu_id = None
     menu = {
-        "text": group_interface.MENU, "parse_mode": "HTML",
+        "text": group_interface.PINNED_MENU_TEXT, "parse_mode": "HTML",
         "reply_markup": group_interface.menu_keyboard(BOT_USERNAME, pinned=True),
     }
     notice = "✅ Тема привязана. Меню закреплено."
