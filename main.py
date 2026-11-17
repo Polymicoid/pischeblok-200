@@ -16,6 +16,7 @@ from aiogram.types import (
 )
 
 import storage
+import group_interface
 from config import ConfigError, load_config
 from schedule import (
     ScheduleHTML, format_date_human, format_day_btn, format_schedule_blocks,
@@ -43,7 +44,7 @@ def log(source: str, message: str):
 class AdminCallbacks(BaseMiddleware):
     async def __call__(self, handler, event: CallbackQuery, data):
         key = event.data or ""
-        if key.startswith("quick:"):
+        if key.startswith(("quick:", "topic:")):
             return await handler(event, data)
         if key.startswith("admin:") and not is_admin(event.from_user.id):
             await event.answer("⛔ Нет доступа.", show_alert=True)
@@ -127,24 +128,6 @@ def kb_main_menu(user_id: int) -> InlineKeyboardMarkup:
     if is_admin(user_id):
         buttons.append([InlineKeyboardButton(text="🔐 Панель старосты (Админка)", callback_data="admin:menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def kb_topic_pinned_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="👀 Быстро: Сегодня", callback_data="quick:today"),
-            InlineKeyboardButton(text="👀 Быстро: Завтра", callback_data="quick:tomorrow"),
-        ],
-        [InlineKeyboardButton(text="📅 Открыть в боте (полное + фото)", url=f"https://t.me/{BOT_USERNAME}?start=schedule")],
-        [
-            InlineKeyboardButton(text="📝 ДЗ", url=f"https://t.me/{BOT_USERNAME}?start=hw"),
-            InlineKeyboardButton(text="📚 Конспекты", url=f"https://t.me/{BOT_USERNAME}?start=notes"),
-        ],
-        [
-            InlineKeyboardButton(text="📖 Учебники", url=f"https://t.me/{BOT_USERNAME}?start=books"),
-            InlineKeyboardButton(text="📢 Объявления", url=f"https://t.me/{BOT_USERNAME}?start=news"),
-        ],
-    ])
 
 
 def kb_schedule_menu() -> InlineKeyboardMarkup:
@@ -264,10 +247,7 @@ def kb_admin_preview(day_key: str, has_topic: bool) -> InlineKeyboardMarkup:
 
 
 # --- СБОРКА ТЕКСТА РАСПИСАНИЯ ---
-MAIN_MENU_TEXT = (
-    "👋 <b>ЛЧПП | Учебный помощник (ПКД-1)</b>\n\n"
-    "Выбери нужный раздел с помощью кнопок ниже:"
-)
+MAIN_MENU_TEXT = group_interface.MENU
 
 
 def format_post_body(date_str: str, status: str, content: str | None, updated_at: str = None) -> str:
@@ -437,35 +417,43 @@ async def cmd_set_topic(message: Message, bot: Bot):
     await safe_delete(message)
     chat_id = message.chat.id
     thread_id = message.message_thread_id
-    old_chat_id, _ = get_topic_config()
-    old_menu_id = get_setting("topic_menu_msg_id")
-
-    menu_text = (
-        "🤖 <b>ЛЧПП | Учебный помощник (ПКД-1)</b>\n\n"
-        "Жми <b>«Быстро»</b>, чтобы глянуть пары прямо здесь в окошке (видишь только ты), "
-        "либо открывай бота в ЛС для полной версии и фото 👇"
-    )
-    sent = await bot.send_message(
-        chat_id=chat_id,
-        message_thread_id=thread_id,
-        text=menu_text,
-        reply_markup=kb_topic_pinned_menu(),
-        parse_mode="HTML",
-    )
-    bind_topic(chat_id, thread_id, sent.message_id)
-    if old_menu_id and old_chat_id:
-        try:
-            await bot.delete_message(chat_id=old_chat_id, message_id=int(old_menu_id))
-        except (TelegramAPIError, ValueError):
-            LOGGER.warning("Старое меню темы осталось в группе.")
-
+    old_chat_id, old_thread_id = get_topic_config()
+    old_menu_id = get_setting("topic_menu_msg_id", "") or ""
+    old_menu_id = int(old_menu_id) if re.fullmatch(r"[0-9]{1,16}", old_menu_id) else None
+    menu_id = None
+    new_menu_id = None
+    menu = {
+        "text": group_interface.MENU, "parse_mode": "HTML",
+        "reply_markup": group_interface.menu_keyboard(BOT_USERNAME, pinned=True),
+    }
     notice = "✅ Тема привязана. Меню закреплено."
     try:
-        await bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id, disable_notification=True)
-    except TelegramAPIError:
-        notice = "✅ Тема привязана. Для закрепления меню проверь права бота."
-
-    log("📌 Тема группы", f"привязана (chat={chat_id}, thread={thread_id}, msg={sent.message_id})")
+        if old_menu_id and (chat_id, thread_id) == (old_chat_id, old_thread_id):
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=old_menu_id, **menu)
+                menu_id = old_menu_id
+            except TelegramBadRequest as error:
+                detail = str(error).lower()
+                if "message is not modified" in detail:
+                    menu_id = old_menu_id
+                elif not any(reason in detail for reason in (
+                    "message to edit not found", "message can't be edited", "there is no text in the message to edit",
+                )):
+                    raise
+        if menu_id is None:
+            sent = await bot.send_message(chat_id=chat_id, message_thread_id=thread_id, **menu)
+            menu_id = new_menu_id = sent.message_id
+        await bot.pin_chat_message(chat_id=chat_id, message_id=menu_id, disable_notification=True)
+        bind_topic(chat_id, thread_id, menu_id)
+    except TelegramAPIError as error:
+        LOGGER.warning("Обновление меню темы не завершено (%s)", type(error).__name__)
+        notice = "⚠️ Не удалось закрепить меню. Проверь права бота. Прежняя привязка сохранена."
+        if new_menu_id:
+            await delete_topic_menu(bot, chat_id, new_menu_id)
+    else:
+        if old_chat_id and old_menu_id and (old_chat_id, old_menu_id) != (chat_id, menu_id):
+            await delete_topic_menu(bot, old_chat_id, old_menu_id)
+        log("📌 Тема группы", f"привязана (chat={chat_id}, thread={thread_id}, msg={menu_id})")
 
     try:
         await bot.send_message(
@@ -475,6 +463,43 @@ async def cmd_set_topic(message: Message, bot: Bot):
         )
     except TelegramAPIError as error:
         LOGGER.warning("Подтверждение привязки не доставлено (%s)", type(error).__name__)
+
+
+async def delete_topic_menu(bot: Bot, chat_id: int, message_id: int):
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except TelegramAPIError as error:
+        LOGGER.warning("Меню темы не удалено (%s)", type(error).__name__)
+
+
+@router.callback_query(F.data.startswith("topic:"))
+async def cb_topic_screen(callback: CallbackQuery, bot: Bot):
+    message = callback.message
+    screen = callback.data.removeprefix("topic:")
+    chat_id, thread_id = get_topic_config()
+    if not isinstance(message, Message) or message.chat.id != chat_id or screen not in group_interface.SCREENS:
+        await callback.answer("Кнопка устарела. Выбери раздел в закреплённом меню.", show_alert=True)
+        return
+    if message.ephemeral_message_id:
+        if (not message.receiver_user or message.receiver_user.id != callback.from_user.id
+                or message.message_thread_id not in (None, thread_id)):
+            await callback.answer("Открой свой экран из закреплённого меню.", show_alert=True)
+            return
+    elif str(message.message_id) != get_setting("topic_menu_msg_id"):
+        await callback.answer("Кнопка устарела. Выбери раздел в закреплённом меню.", show_alert=True)
+        return
+
+    try:
+        await group_interface.show_screen(callback, bot, message, screen, BOT_USERNAME, thread_id)
+    except TelegramAPIError as error:
+        LOGGER.warning("Персональный экран недоступен (%s)", type(error).__name__)
+        fallback = (
+            build_compact_alert_text(screen) if screen in group_interface.DAYS
+            else "Персональный экран недоступен. В закреплённом меню есть «Быстро» и ссылка на бота."
+        )
+        await callback.answer(fallback, show_alert=True)
+    else:
+        await callback.answer()
 
 
 @router.callback_query(F.data.startswith("quick:"))
@@ -519,20 +544,25 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
     await state.clear()
     arg = command.args
 
+    if arg in group_interface.DAYS:
+        text, photo, _ = build_schedule_view(arg)
+        keyboard = kb_schedule_view(arg)
+        if photo:
+            caption = ScheduleHTML(text).limited(CAPTION_LIMIT)
+            await message.answer_photo(photo, caption=caption, reply_markup=keyboard, parse_mode="HTML")
+            if telegram_length(ScheduleHTML(text).plain_text()) > CAPTION_LIMIT:
+                await message.answer(ScheduleHTML(text).limited(MESSAGE_LIMIT), parse_mode="HTML")
+        else:
+            await message.answer(ScheduleHTML(text).limited(MESSAGE_LIMIT), reply_markup=keyboard, parse_mode="HTML")
+        return
     if arg == "schedule":
         text = "📅 <b>Раздел «Расписание»</b>\n\nВыбери день, на который хочешь посмотреть пары:"
         await message.answer(text, reply_markup=kb_schedule_menu(), parse_mode="HTML")
         return
 
-    if arg in ("hw", "notes", "books", "news"):
-        names = {
-            "hw": "📝 Домашние задания",
-            "notes": "📚 Конспекты",
-            "books": "📖 Учебники и методички",
-            "news": "📢 Объявления",
-        }
+    if arg in group_interface.SECTIONS:
         await message.answer(
-            f"<b>{names[arg]}</b>\n\n🚧 <i>Этот раздел находится в разработке и появится в следующих обновлениях.</i>",
+            group_interface.section_text(arg),
             reply_markup=kb_stub_back(),
             parse_mode="HTML",
         )
@@ -570,14 +600,8 @@ async def cb_view_schedule(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("stub:"))
 async def cb_stub(callback: CallbackQuery):
-    names = {
-        "hw": "📝 Домашние задания",
-        "notes": "📚 Конспекты",
-        "books": "📖 Учебники и методички",
-        "news": "📢 Объявления",
-    }
     key = callback.data.split(":")[1]
-    text = f"<b>{names.get(key, 'Раздел')}</b>\n\n🚧 <i>Этот раздел находится в разработке и появится в следующих обновлениях.</i>"
+    text = group_interface.section_text(key) if key in group_interface.SECTIONS else "Раздел недоступен."
     await render_screen(callback.message, text, kb_stub_back())
     await callback.answer()
 
@@ -597,7 +621,7 @@ async def cb_admin_menu(callback: CallbackQuery, state: FSMContext):
     else:
         header = "🔐 <b>Панель старосты</b>"
 
-    text = f"{header}\n\n{topic_status}\n\nВыбери действие:"
+    text = f"{header}\n{group_interface.BRAND}\n\n{topic_status}\n\nВыбери действие:"
     await render_screen(callback.message, text, kb_admin_menu())
     await callback.answer()
 

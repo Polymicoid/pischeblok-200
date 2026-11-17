@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -128,6 +129,7 @@ class FakeSession(BaseSession):
         self.calls = []
         self.fail_post = False
         self.cannot_edit = False
+        self.failed_methods = {}
         self.message_id = 100
 
     async def close(self):
@@ -140,25 +142,35 @@ class FakeSession(BaseSession):
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
         name = type(method).__name__
+        if name in self.failed_methods:
+            raise TelegramBadRequest(method, self.failed_methods[name])
         if name == "GetMe":
             return User(id=1, is_bot=True, first_name="Тест", username="test_bot")
         if self.cannot_edit and name == "EditMessageText" and method.chat_id < 0:
             raise TelegramBadRequest(method, "there is no text in the message to edit")
-        if name in {"SendMessage", "SendPhoto"}:
+        if name in {"SendMessage", "SendPhoto", "SendRichMessage"}:
             if self.fail_post and method.chat_id < 0:
                 raise TelegramBadRequest(method, "test failure")
             self.message_id += 1
-            return Message.model_validate({
+            payload = {
                 "message_id": self.message_id,
-                "chat": {"id": method.chat_id, "type": "private"},
+                "chat": {"id": method.chat_id, "type": "supergroup" if method.chat_id < 0 else "private"},
                 "date": 1,
-            }, context={"bot": bot})
+            }
+            if params := method.ephemeral_message_parameters:
+                payload.update(
+                    message_id=0,
+                    ephemeral_message_id=self.message_id,
+                    receiver_user={"id": params.receiver_user_id, "is_bot": False, "first_name": "Тест"},
+                )
+            return Message.model_validate(payload, context={"bot": bot})
         return True
 
 
-class RouterTests(DatabaseCase, unittest.IsolatedAsyncioTestCase):
+class RouterCase(DatabaseCase, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.enterContext(patch.object(main, "ADMIN_IDS", frozenset({11, 22})))
+        self.enterContext(patch.object(main, "BOT_USERNAME", "test_bot"))
         self.session = FakeSession()
         self.bot = Bot(token="1:offline-test-value", session=self.session)
         self.dispatcher = Dispatcher()
@@ -166,24 +178,41 @@ class RouterTests(DatabaseCase, unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.bot.session.close)
         self.addCleanup(setattr, main.router, "_parent_router", None)
 
-    async def feed(self, *, action=None, text=None, user_id=11, message_id=10, group=False, photo=False, inline=False):
+    async def feed(
+        self, *, action=None, text=None, user_id=11, message_id=10, group=False,
+        photo=False, inline=False, thread_id=None, ephemeral_id=None, receiver_id=None,
+        callback_id=None, chat_id=-1007,
+    ):
         user = {"id": user_id, "is_bot": False, "first_name": "Тест"}
-        chat = {"id": -1007 if group else user_id, "type": "supergroup" if group else "private"}
+        chat = {"id": chat_id if group else user_id, "type": "supergroup" if group else "private"}
         message = {"message_id": message_id, "date": 1, "chat": chat}
+        if thread_id is not None:
+            message.update(message_thread_id=thread_id, is_topic_message=True)
+        if ephemeral_id:
+            message.update(
+                message_id=0, ephemeral_message_id=ephemeral_id,
+                receiver_user={**user, "id": receiver_id or user_id},
+            )
+        if photo:
+            message["photo"] = [{"file_id": "photo", "file_unique_id": "unique", "width": 120, "height": 120}]
         update = {"update_id": 1}
         if action:
-            update["callback_query"] = {"id": "1", "from": user, "chat_instance": "test", "data": action, "message": message}
+            update["callback_query"] = {
+                "id": callback_id or str(user_id), "from": user, "chat_instance": "test",
+                "data": action, "message": message,
+            }
         elif inline:
             update["inline_query"] = {"id": "1", "from": user, "query": "", "offset": ""}
         elif photo:
             update["message"] = {
                 **message, "from": user, "caption": text,
-                "photo": [{"file_id": "photo", "file_unique_id": "unique", "width": 120, "height": 120}],
             }
         else:
             update["message"] = {**message, "from": user, "text": text}
         await self.dispatcher.feed_update(self.bot, Update.model_validate(update, context={"bot": self.bot}))
 
+
+class RouterTests(RouterCase):
     async def test_non_admin_cannot_use_admin_callbacks_or_bind_topic(self):
         storage.save_schedule("2026-11-15", "published", learned_rooms=(("Биология", "Каб. 12"),))
         for action in ("admin:menu", "admin:only_photo", "admin:rooms_clear", "admin:confirm:topic",
@@ -252,6 +281,139 @@ class RouterTests(DatabaseCase, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(type(self.session.calls[-1]).__name__, "AnswerInlineQuery")
         article = self.session.calls[-1].results[0]
         self.assertIn("<b>Биология</b>", article.input_message_content.message_text)
+
+
+class TopicInterfaceTests(RouterCase):
+    def methods(self):
+        return [type(call).__name__ for call in self.session.calls]
+
+    async def open(self, action, **kwargs):
+        await self.feed(action=f"topic:{action}", group=True, thread_id=2, **kwargs)
+
+    async def test_pin_and_refresh_same_message(self):
+        await self.feed(text="/set_topic", group=True, thread_id=2)
+        self.assertEqual(self.methods(), ["DeleteMessage", "SendMessage", "PinChatMessage", "SendMessage"])
+        menu = self.session.calls[1]
+        self.assertIn("ПИЩЕБЛОК-200", menu.text)
+        self.assertNotIn("ЛЧПП", menu.text)
+        self.assertEqual(menu.reply_markup.inline_keyboard[0][0].callback_data, "topic:schedule")
+        saved_id = int(storage.get_setting("topic_menu_msg_id"))
+        storage.save_schedule("2026-11-16", "published", topic_msg_id=22)
+        self.session.calls.clear()
+        self.session.failed_methods["EditMessageText"] = "message is not modified"
+        await self.feed(text="/set_topic", group=True, thread_id=2)
+        self.assertEqual(self.methods(), ["DeleteMessage", "EditMessageText", "PinChatMessage", "SendMessage"])
+        self.assertEqual(self.session.calls[2].message_id, saved_id)
+        self.assertEqual(storage.get_schedule("2026-11-16")[4], 22)
+
+    async def test_rebind_preserves_old_menu_on_pin_failure(self):
+        storage.bind_topic(-1007, 2, 42)
+        storage.save_schedule("2026-11-16", "published", topic_msg_id=22)
+        self.session.failed_methods["PinChatMessage"] = "bot has no rights"
+        await self.feed(text="/set_topic", group=True, thread_id=3)
+        self.assertEqual(storage.get_topic_config(), (-1007, 2))
+        self.assertEqual(storage.get_setting("topic_menu_msg_id"), "42")
+        self.assertEqual(storage.get_schedule("2026-11-16")[4], 22)
+        self.assertNotIn(42, [call.message_id for call in self.session.calls if type(call).__name__ == "DeleteMessage"])
+
+    async def test_missing_pin_is_replaced_and_rebind_commits_after_pin(self):
+        storage.bind_topic(-1007, 2, 42)
+        self.session.failed_methods["EditMessageText"] = "message to edit not found"
+        await self.feed(text="/set_topic", group=True, thread_id=2)
+        self.assertEqual(self.methods(), [
+            "DeleteMessage", "EditMessageText", "SendMessage", "PinChatMessage", "DeleteMessage", "SendMessage",
+        ])
+        self.assertEqual(self.session.calls[4].message_id, 42)
+        self.assertEqual(storage.get_setting("topic_menu_msg_id"), "101")
+
+    async def test_student_navigation_is_private_for_two_concurrent_users(self):
+        storage.bind_topic(-1007, 2, 42)
+        storage.save_schedule("2026-11-16", "published", "<b>1 пара (08:30 – 10:05)</b>\n🧪 Химия\n📍 Каб. 6")
+        await asyncio.gather(*(self.open("schedule", user_id=user, message_id=42) for user in (98, 99)))
+        sends = [call for call in self.session.calls if type(call).__name__ == "SendMessage"]
+        self.assertEqual({call.ephemeral_message_parameters.receiver_user_id for call in sends}, {98, 99})
+        self.assertEqual({call.ephemeral_message_parameters.callback_query_id for call in sends}, {"98", "99"})
+        self.assertTrue(all(call.message_thread_id == 2 for call in sends))
+        self.session.calls.clear()
+        await asyncio.gather(
+            self.open("today", user_id=98, ephemeral_id=101),
+            self.open("tomorrow", user_id=99, ephemeral_id=102),
+        )
+        edits = [call for call in self.session.calls if type(call).__name__ == "EditEphemeralMessageText"]
+        self.assertEqual({(call.receiver_user_id, call.ephemeral_message_id) for call in edits}, {(98, 101), (99, 102)})
+        today = next(call for call in edits if call.receiver_user_id == 98)
+        self.assertIn("1️⃣ 08:30–10:05", today.rich_message.html)
+        self.assertIn("Кабинет 6", today.rich_message.html)
+        self.assertIn("пока не опубликовано", next(call for call in edits if call.receiver_user_id == 99).rich_message.html)
+        await self.open("main", user_id=98, ephemeral_id=101)
+        self.assertIn("ПИЩЕБЛОК-200", self.session.calls[-2].text)
+        self.assertNotIn("EditMessageText", self.methods())
+        self.assertEqual(storage.get_setting("topic_menu_msg_id"), "42")
+
+    async def test_expired_screen_is_replaced_for_same_student(self):
+        storage.bind_topic(-1007, 2, 42)
+        self.session.failed_methods["EditEphemeralMessageText"] = "message to edit not found"
+        await self.open("hw", user_id=99, ephemeral_id=101)
+        self.assertEqual(self.methods(), ["EditEphemeralMessageText", "SendMessage", "DeleteEphemeralMessage", "AnswerCallbackQuery"])
+        self.assertEqual(self.session.calls[1].ephemeral_message_parameters.receiver_user_id, 99)
+        self.assertIn("Раздел в разработке", self.session.calls[1].text)
+
+    async def test_stale_or_foreign_buttons_only_get_private_alerts(self):
+        storage.bind_topic(-1007, 2, 42)
+        await self.open("schedule", user_id=99, message_id=41)
+        await self.open("main", user_id=99, ephemeral_id=101, receiver_id=98)
+        self.assertEqual(self.methods(), ["AnswerCallbackQuery", "AnswerCallbackQuery"])
+        self.assertTrue(all(call.show_alert for call in self.session.calls))
+
+    async def test_rich_fallback_and_total_send_failure(self):
+        storage.bind_topic(-1007, 2, 42)
+        storage.save_schedule("2026-11-16", "holiday")
+        self.session.failed_methods["SendRichMessage"] = "unsupported"
+        await self.open("today", user_id=99, message_id=42)
+        self.assertEqual(self.methods(), ["SendRichMessage", "SendMessage", "AnswerCallbackQuery"])
+        self.assertIn("Выходной", self.session.calls[1].text)
+        self.assertEqual(self.session.calls[1].ephemeral_message_parameters.receiver_user_id, 99)
+        self.session.calls.clear()
+        self.session.failed_methods["SendMessage"] = "unsupported"
+        await self.open("today", user_id=99, message_id=42)
+        self.assertTrue(self.session.calls[-1].show_alert)
+        self.assertIn("Выходной", self.session.calls[-1].text)
+        self.assertLessEqual(schedule.telegram_length(self.session.calls[-1].text), 200)
+
+    async def test_photo_and_back_to_main_after_reopening_db(self):
+        storage.bind_topic(-1007, 2, 42)
+        storage.save_schedule("2026-11-16", "published", "🧪" * 700, "photo")
+        storage.init_db()
+        await self.open("today", user_id=99, message_id=42)
+        sent = self.session.calls[0]
+        self.assertEqual(type(sent).__name__, "SendPhoto")
+        self.assertEqual(sent.photo, "photo")
+        self.assertEqual(sent.ephemeral_message_parameters.receiver_user_id, 99)
+        self.assertLessEqual(schedule.telegram_length(schedule.ScheduleHTML(sent.caption).plain_text()), 1024)
+        self.assertEqual(sent.reply_markup.inline_keyboard[-1][0].url, "https://t.me/test_bot?start=today")
+        await self.open("main", user_id=99, ephemeral_id=101, photo=True)
+        self.assertEqual(self.methods()[-3:], ["SendMessage", "DeleteEphemeralMessage", "AnswerCallbackQuery"])
+        self.assertNotIn("DeleteMessage", self.methods())
+
+    async def test_photo_failure_preserves_text_and_private_link(self):
+        storage.bind_topic(-1007, 2, 42)
+        storage.save_schedule("2026-11-16", "published", "Химия", "photo")
+        self.session.failed_methods["SendPhoto"] = "unsupported photo"
+        await self.open("today", user_id=99, message_id=42)
+        self.assertEqual(self.methods(), ["SendPhoto", "SendMessage", "AnswerCallbackQuery"])
+        fallback = self.session.calls[1]
+        self.assertIn("Химия", fallback.text)
+        self.assertEqual(fallback.ephemeral_message_parameters.receiver_user_id, 99)
+
+    async def test_brand_and_callback_sizes(self):
+        await self.feed(text="/start", user_id=99)
+        self.assertIn("ПИЩЕБЛОК-200", self.session.calls[0].text)
+        self.assertNotIn("ЛЧПП", self.session.calls[0].text)
+        for section in main.group_interface.SCREENS:
+            _, _, markup = main.group_interface.render(section, "test_bot")
+            for row in markup.inline_keyboard:
+                for button in row:
+                    self.assertLessEqual(len(button.callback_data.encode()), 64)
 
 
 class StartupTests(DatabaseCase, unittest.IsolatedAsyncioTestCase):
