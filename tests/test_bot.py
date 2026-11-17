@@ -393,6 +393,7 @@ class TopicInterfaceTests(RouterCase):
         self.assertEqual({call.ephemeral_message_parameters.receiver_user_id for call in sends}, {98, 99})
         self.assertEqual({call.ephemeral_message_parameters.callback_query_id for call in sends}, {"98", "99"})
         self.assertTrue(all(call.message_thread_id == 2 for call in sends))
+        self.assertTrue(all(call.ephemeral_message_parameters.replace_callback_query_message for call in sends))
         self.session.calls.clear()
         await asyncio.gather(
             self.open("today", user_id=98, ephemeral_id=101),
@@ -406,24 +407,25 @@ class TopicInterfaceTests(RouterCase):
         self.assertIn("Каб. 6\n\n<b>2 пара", today.text)
         self.assertIn("пока не опубликовано", next(call for call in edits if call.receiver_user_id == 99).text)
         await self.open("main", user_id=98, ephemeral_id=101)
-        self.assertIn("ПИЩЕБЛОК-200", self.session.calls[-2].text)
+        self.assertEqual(self.methods()[-2:], ["DeleteEphemeralMessage", "AnswerCallbackQuery"])
+        self.assertIsNone(storage.get_topic_screen(-1007, 2, 98))
+        self.assertEqual(storage.get_topic_screen(-1007, 2, 99), (102, False))
         self.assertNotIn("EditMessageText", self.methods())
         self.assertEqual(storage.get_setting("topic_menu_msg_id"), "42")
 
-    async def test_expired_screen_is_replaced_for_same_student(self):
+    async def test_expired_screen_asks_to_reopen_from_pin_without_sending_duplicate(self):
         storage.bind_topic(-1007, 2, 42)
         self.session.failed_methods["EditEphemeralMessageText"] = "message to edit not found"
         await self.open("hw", user_id=99, ephemeral_id=87)
-        self.assertEqual(self.methods(), ["EditEphemeralMessageText", "SendMessage", "DeleteEphemeralMessage", "AnswerCallbackQuery"])
-        self.assertEqual(self.session.calls[1].ephemeral_message_parameters.receiver_user_id, 99)
-        self.assertEqual(self.session.calls[2].ephemeral_message_id, 87)
-        self.assertIn("Раздел в разработке", self.session.calls[1].text)
+        self.assertEqual(self.methods(), ["EditEphemeralMessageText", "AnswerCallbackQuery"])
+        self.assertIn("закреплённого меню", self.session.calls[-1].text)
 
     async def test_stale_or_foreign_buttons_only_get_private_alerts(self):
         storage.bind_topic(-1007, 2, 42)
         await self.open("schedule", user_id=99, message_id=41)
         await self.open("main", user_id=99, ephemeral_id=101, receiver_id=98)
-        self.assertEqual(self.methods(), ["AnswerCallbackQuery", "AnswerCallbackQuery"])
+        await self.open("main", user_id=99, message_id=42)
+        self.assertEqual(self.methods(), ["AnswerCallbackQuery"] * 3)
         self.assertTrue(all(call.show_alert for call in self.session.calls))
 
     async def test_temporary_send_failure_uses_private_alert(self):
@@ -454,35 +456,38 @@ class TopicInterfaceTests(RouterCase):
         self.assertEqual(storage.get_topic_screen(-1007, 2, 99), (102, False))
         self.session.calls.clear()
         await self.open("main", user_id=99, ephemeral_id=88)
-        self.assertEqual(self.methods(), ["EditEphemeralMessageText", "DeleteEphemeralMessage", "AnswerCallbackQuery"])
-        self.assertEqual(self.session.calls[0].ephemeral_message_id, 102)
-        self.assertEqual(self.session.calls[1].ephemeral_message_id, 88)
+        self.assertEqual(self.methods(), ["DeleteEphemeralMessage", "DeleteEphemeralMessage", "AnswerCallbackQuery"])
+        self.assertEqual(self.session.calls[0].ephemeral_message_id, 88)
+        self.assertEqual(self.session.calls[1].ephemeral_message_id, 102)
+        self.assertIsNone(storage.get_topic_screen(-1007, 2, 99))
 
     async def test_photo_and_back_to_main_after_reopening_db(self):
         storage.bind_topic(-1007, 2, 42)
         storage.save_schedule("2026-11-16", "published", "🧪" * 700, "photo")
         storage.init_db()
-        await self.open("today", user_id=99, message_id=42)
-        sent = self.session.calls[0]
-        self.assertEqual(type(sent).__name__, "SendPhoto")
-        self.assertEqual(sent.photo, "photo")
-        self.assertEqual(sent.ephemeral_message_parameters.receiver_user_id, 99)
-        self.assertLessEqual(schedule.telegram_length(schedule.ScheduleHTML(sent.caption).plain_text()), 1024)
-        self.assertEqual(sent.reply_markup.inline_keyboard[-1][0].callback_data, "topic:text:today")
-        await self.open("text:today", user_id=99, ephemeral_id=101, photo=True)
-        self.assertEqual(self.methods()[-3:], ["SendMessage", "DeleteEphemeralMessage", "AnswerCallbackQuery"])
-        self.assertIn("🧪" * 700, self.session.calls[-3].text)
-        self.assertEqual(self.session.calls[-3].reply_markup.inline_keyboard[-2][0].callback_data, "topic:today")
+        await self.open("schedule", user_id=99, message_id=42)
+        self.session.calls.clear()
+        await self.open("today", user_id=99, ephemeral_id=101)
+        edit = self.session.calls[0]
+        self.assertEqual(type(edit).__name__, "EditEphemeralMessageText")
+        self.assertEqual(edit.rich_message.media[0].media.media, "photo")
+        self.assertEqual(edit.ephemeral_message_id, 101)
+        self.assertEqual(edit.reply_markup.inline_keyboard[-2][0].callback_data, "topic:text:today")
+        await self.open("text:today", user_id=99, ephemeral_id=101)
+        self.assertEqual(self.methods()[-2:], ["EditEphemeralMessageText", "AnswerCallbackQuery"])
+        self.assertIn("🧪" * 700, self.session.calls[-2].text)
+        self.assertEqual(self.session.calls[-2].reply_markup.inline_keyboard[-2][0].callback_data, "topic:today")
         self.assertNotIn("DeleteMessage", self.methods())
 
     async def test_photo_failure_preserves_text_in_topic(self):
         storage.bind_topic(-1007, 2, 42)
         storage.save_schedule("2026-11-16", "published", "Химия", "photo")
-        self.session.failed_methods["SendPhoto"] = "unsupported photo"
+        self.session.failed_methods["SendRichMessage"] = "unsupported photo"
         await self.open("today", user_id=99, message_id=42)
-        self.assertEqual(self.methods(), ["SendPhoto", "SendMessage", "AnswerCallbackQuery"])
+        self.assertEqual(self.methods(), ["SendRichMessage", "SendMessage", "AnswerCallbackQuery"])
         fallback = self.session.calls[1]
         self.assertIn("Химия", fallback.text)
+        self.assertTrue(fallback.ephemeral_message_parameters.replace_callback_query_message)
         self.assertEqual(fallback.ephemeral_message_parameters.receiver_user_id, 99)
 
     async def test_brand_and_callback_sizes(self):

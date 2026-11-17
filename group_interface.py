@@ -2,16 +2,13 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramNotFound
 from aiogram.types import (
     CallbackQuery, EphemeralMessageParameters, InlineKeyboardButton,
-    InlineKeyboardMarkup, InputMediaPhoto, Message,
+    InlineKeyboardMarkup, InputMediaPhoto, InputRichMessage, InputRichMessageMedia, Message,
 )
 
-from schedule import ScheduleHTML, build_schedule_view, format_day_btn, telegram_length
-from storage import get_topic_screen, save_topic_screen
-
-
+from schedule import ScheduleHTML, build_schedule_view, format_day_btn
+from storage import clear_topic_screen, get_topic_screen, save_topic_screen
 
 BRAND = "👹 ПИЩЕБЛОК-200 | Учебный помощник"
-MENU = f"<b>{BRAND}</b>\n\n🍳 Для группы ПКД-1. Выбери нужный раздел:"
 PINNED_MENU_TEXT = (
     "👹 <b>ПИЩЕБЛОК-200</b>\n"
     "<i>Учебный штаб группы ПКД-1</i>\n\n"
@@ -30,7 +27,8 @@ SECTIONS = {
 }
 DAYS = {"today", "tomorrow"}
 TEXT_SCREENS = {f"text:{day}" for day in DAYS}
-SCREENS = {"main", "schedule", *DAYS, *TEXT_SCREENS, *SECTIONS}
+CLOSE_SCREEN = "main"  # Совместимость с кнопками уже открытых экранов.
+SCREENS = {"schedule", *DAYS, *TEXT_SCREENS, *SECTIONS}
 
 
 def section_text(section: str) -> str:
@@ -49,10 +47,7 @@ def menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def render(screen: str) -> tuple[str, str | None, InlineKeyboardMarkup]:
-    if screen == "main":
-        return MENU, None, menu_keyboard()
-
-    back = [button("⬅️ Главное меню", "main")]
+    back = [button("⬅️ В закреп", CLOSE_SCREEN)]
     if screen in SECTIONS:
         return section_text(screen), None, InlineKeyboardMarkup(inline_keyboard=[back])
 
@@ -64,42 +59,63 @@ def render(screen: str) -> tuple[str, str | None, InlineKeyboardMarkup]:
         if photo and screen in TEXT_SCREENS:
             rows.append([button("📸 К фото", day)])
             photo = None
+        elif photo:
+            rows.append([button("📄 Только текст", f"text:{day}")])
     else:
         text, photo = "📅 <b>Расписание</b>\n\nВыбери день.", None
     return text, photo, InlineKeyboardMarkup(inline_keyboard=[*rows, back])
 
 
-async def remove_screen(bot: Bot, chat_id: int, user_id: int, screen_id: int):
+async def remove_screen(bot: Bot, chat_id: int, user_id: int, screen_id: int, *, required: bool = False):
     try:
         await bot.delete_ephemeral_message(
             chat_id=chat_id, receiver_user_id=user_id, ephemeral_message_id=screen_id,
         )
-    except TelegramAPIError:
-        # Устаревший экран уже мог исчезнуть у пользователя.
-        pass
+    except TelegramNotFound:
+        return
+    except TelegramAPIError as error:
+        if required and "not found" not in str(error).lower():
+            raise
+
+
+async def close_screen(bot: Bot, message: Message, user_id: int, thread_id: int | None):
+    scope = (message.chat.id, thread_id or 0, user_id)
+    active = get_topic_screen(*scope)
+    if message.ephemeral_message_id:
+        await remove_screen(bot, message.chat.id, user_id, message.ephemeral_message_id, required=True)
+    if active and active[0] != message.ephemeral_message_id:
+        await remove_screen(bot, message.chat.id, user_id, active[0], required=True)
+    clear_topic_screen(*scope)
+
+
+def photo_message(text: str, photo: str) -> InputRichMessage:
+    # Встроенное фото можно убрать следующей правкой того же временного сообщения.
+    paragraphs = text.replace("\n\n", "</p><p>").replace("\n", "<br>")
+    return InputRichMessage(
+        html=f'<p>{paragraphs}</p><img src="tg://photo?id=schedule-photo"/>',
+        media=[InputRichMessageMedia(id="schedule-photo", media=InputMediaPhoto(media=photo))],
+        skip_entity_detection=True,
+    )
 
 
 async def show_screen(
     callback: CallbackQuery, bot: Bot, message: Message, screen: str, thread_id: int | None,
 ):
     text, photo, markup = render(screen)
-    safe = ScheduleHTML(text)
-    # Telegram сжимает интервалы между Rich-параграфами. HTML сохраняет пустые строки.
-    text = safe.limited(4096)
-    caption = safe.limited(1024, "\n… Полный текст доступен по кнопке ниже.")
-    if photo and telegram_length(safe.plain_text()) > 1024:
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            *markup.inline_keyboard,
-            [button("📄 Полный текст", f"text:{screen}")],
-        ])
+    text = ScheduleHTML(text).limited(4096)
+    payload = {"text": text, "parse_mode": "HTML"}
+    if photo:
+        payload = {"rich_message": photo_message(text, photo)}
+    photo_fallback = {
+        "text": ScheduleHTML(text + "\n\n📸 Фото временно недоступно.").limited(4096),
+        "parse_mode": "HTML",
+    }
 
     chat_id, user_id = message.chat.id, callback.from_user.id
     scope = (chat_id, thread_id or 0, user_id)
     clicked_id = message.ephemeral_message_id
     active = get_topic_screen(*scope)
-    if not active and clicked_id:
-        active = (clicked_id, bool(message.photo))
-    active_id, active_has_photo = active or (None, False)
+    active_id = active[0] if active else clicked_id
     stale_ids = {value for value in (active_id, clicked_id) if value}
     target = {
         "chat_id": chat_id,
@@ -108,44 +124,34 @@ async def show_screen(
     }
     # Из закрепа отправляем экран клиенту, который нажал кнопку. Правка старого
     # экрана может пройти на сервере, даже если клиент больше его не показывает.
-    if clicked_id and active_id and active_has_photo == bool(photo):
+    if clicked_id:
         try:
-            if photo:
-                media = InputMediaPhoto(media=photo, caption=caption, parse_mode="HTML")
-                await bot.edit_ephemeral_message_media(**target, media=media, reply_markup=markup)
-            else:
-                await bot.edit_ephemeral_message_text(**target, text=text, parse_mode="HTML", reply_markup=markup)
+            await bot.edit_ephemeral_message_text(**target, **payload, reply_markup=markup)
         except (TelegramBadRequest, TelegramNotFound) as error:
-            edited = "message is not modified" in str(error).lower()
-        else:
-            edited = True
-        if edited:
-            save_topic_screen(*scope, active_id, active_has_photo)
-            for stale_id in stale_ids - {active_id}:
-                await remove_screen(bot, chat_id, user_id, stale_id)
-            return
+            if "message is not modified" not in str(error).lower():
+                if not photo:
+                    raise
+                await bot.edit_ephemeral_message_text(**target, **photo_fallback, reply_markup=markup)
+        save_topic_screen(*scope, active_id, False)
+        for stale_id in stale_ids - {active_id}:
+            await remove_screen(bot, chat_id, user_id, stale_id)
+        return
 
     send = {
         "chat_id": chat_id, "message_thread_id": thread_id, "reply_markup": markup,
         "ephemeral_message_parameters": EphemeralMessageParameters(
-            receiver_user_id=user_id, callback_query_id=callback.id, replace_callback_query_message=False,
+            receiver_user_id=user_id, callback_query_id=callback.id, replace_callback_query_message=True,
         ),
     }
-    sent_photo = bool(photo)
     if photo:
         try:
-            sent = await bot.send_photo(**send, photo=photo, caption=caption, parse_mode="HTML")
+            sent = await bot.send_rich_message(**send, **payload)
         except (TelegramBadRequest, TelegramNotFound):
-            sent_photo = False
-            hint = "\n\n📸 Фото временно недоступно. Нажми «Обновить», чтобы повторить попытку."
-            sent = await bot.send_message(
-                **send,
-                text=ScheduleHTML(text + hint).limited(4096), parse_mode="HTML",
-            )
+            sent = await bot.send_message(**send, **photo_fallback)
     else:
-        sent = await bot.send_message(**send, text=text, parse_mode="HTML")
+        sent = await bot.send_message(**send, **payload)
 
     if sent.ephemeral_message_id:
-        save_topic_screen(*scope, sent.ephemeral_message_id, sent_photo)
+        save_topic_screen(*scope, sent.ephemeral_message_id, False)
         for stale_id in stale_ids - {sent.ephemeral_message_id}:
             await remove_screen(bot, chat_id, user_id, stale_id)

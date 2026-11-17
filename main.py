@@ -349,7 +349,8 @@ async def cb_topic_screen(callback: CallbackQuery, bot: Bot):
     message = callback.message
     screen = callback.data.removeprefix("topic:")
     chat_id, thread_id = get_topic_config()
-    if not isinstance(message, Message) or message.chat.id != chat_id or screen not in group_interface.SCREENS:
+    valid_screen = screen in group_interface.SCREENS or screen == group_interface.CLOSE_SCREEN
+    if not isinstance(message, Message) or message.chat.id != chat_id or not valid_screen:
         await callback.answer("Кнопка устарела. Выбери раздел в закреплённом меню.", show_alert=True)
         return
     if message.ephemeral_message_id:
@@ -357,12 +358,15 @@ async def cb_topic_screen(callback: CallbackQuery, bot: Bot):
                 or message.message_thread_id not in (None, thread_id)):
             await callback.answer("Открой свой экран из закреплённого меню.", show_alert=True)
             return
-    elif str(message.message_id) != get_setting("topic_menu_msg_id"):
+    elif screen == group_interface.CLOSE_SCREEN or str(message.message_id) != get_setting("topic_menu_msg_id"):
         await callback.answer("Кнопка устарела. Выбери раздел в закреплённом меню.", show_alert=True)
         return
 
     try:
-        await group_interface.show_screen(callback, bot, message, screen, thread_id)
+        if screen == group_interface.CLOSE_SCREEN:
+            await group_interface.close_screen(bot, message, callback.from_user.id, thread_id)
+        else:
+            await group_interface.show_screen(callback, bot, message, screen, thread_id)
     except TelegramAPIError as error:
         LOGGER.warning("Персональный экран недоступен (%s)", type(error).__name__)
         await callback.answer(

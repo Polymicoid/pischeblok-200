@@ -185,6 +185,14 @@ def save_topic_screen(chat_id: int, thread_key: int, user_id: int, ephemeral_id:
         """, (chat_id, thread_key, user_id, ephemeral_id, has_photo))
 
 
+def clear_topic_screen(chat_id: int, thread_key: int, user_id: int):
+    with connection() as conn:
+        conn.execute(
+            "DELETE FROM topic_screens WHERE chat_id=? AND thread_key=? AND user_id=?",
+            (chat_id, thread_key, user_id),
+        )
+
+
 def set_topic_message(date_str: str, message_id: int):
     with connection() as conn:
         conn.execute(
