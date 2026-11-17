@@ -138,13 +138,16 @@ async def show_screen(
             await remove_screen(bot, chat_id, user_id, stale_id)
         return
 
-    # Подмена закрепа может исчезнуть в клиенте даже после успешного ответа API.
+    if active_id:
+        # Закрытие старой подмены может вернуть закреп. Делаем это до открытия новой.
+        await remove_screen(bot, chat_id, user_id, active_id, required=True)
+        clear_topic_screen(*scope)
+
     destination = {
-        "chat_id": chat_id,
-        "message_thread_id": thread_id,
+        "chat_id": None,
         "reply_markup": markup,
         "ephemeral_message_parameters": EphemeralMessageParameters(
-            receiver_user_id=user_id, callback_query_id=callback.id, replace_callback_query_message=False,
+            callback_query_id=callback.id, replace_callback_query_message=True,
         ),
     }
     if photo:
@@ -157,5 +160,3 @@ async def show_screen(
 
     if sent.ephemeral_message_id:
         save_topic_screen(*scope, sent.ephemeral_message_id, False)
-        for stale_id in stale_ids - {sent.ephemeral_message_id}:
-            await remove_screen(bot, chat_id, user_id, stale_id)

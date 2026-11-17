@@ -176,6 +176,7 @@ class FakeSession(BaseSession):
         super().__init__()
         self.calls = []
         self.failed_methods = {}
+        self.callbacks = {}
         self.message_id = 100
 
     async def close(self):
@@ -196,6 +197,8 @@ class FakeSession(BaseSession):
             params = method.ephemeral_message_parameters
             chat_id = method.chat_id
             user_id = params.receiver_user_id if params else None
+            if params and chat_id is None:
+                chat_id, user_id = self.callbacks[params.callback_query_id]
             self.message_id += 1
             payload = {
                 "message_id": self.message_id,
@@ -242,6 +245,7 @@ class RouterCase(DatabaseCase, unittest.IsolatedAsyncioTestCase):
         update = {"update_id": 1}
         if action:
             callback_id = callback_id or str(user_id)
+            self.session.callbacks[callback_id] = (chat["id"], user_id)
             update["callback_query"] = {
                 "id": callback_id, "from": user, "chat_instance": "test",
                 "data": action, "message": message,
@@ -384,10 +388,10 @@ class TopicInterfaceTests(RouterCase):
         )
         await asyncio.gather(*(self.open("schedule", user_id=user, message_id=42) for user in (98, 99)))
         sends = [call for call in self.session.calls if type(call).__name__ == "SendMessage"]
-        self.assertEqual({call.ephemeral_message_parameters.receiver_user_id for call in sends}, {98, 99})
+        self.assertTrue(all(call.ephemeral_message_parameters.receiver_user_id is None for call in sends))
         self.assertEqual({call.ephemeral_message_parameters.callback_query_id for call in sends}, {"98", "99"})
-        self.assertTrue(all(call.chat_id == -1007 and call.message_thread_id == 2 for call in sends))
-        self.assertTrue(all(call.ephemeral_message_parameters.replace_callback_query_message is False for call in sends))
+        self.assertTrue(all(call.chat_id is None and call.message_thread_id is None for call in sends))
+        self.assertTrue(all(call.ephemeral_message_parameters.replace_callback_query_message for call in sends))
         self.session.calls.clear()
         await asyncio.gather(
             self.open("today", user_id=98, ephemeral_id=101),
@@ -432,10 +436,10 @@ class TopicInterfaceTests(RouterCase):
         self.session.calls.clear()
         self.session.failed_methods["SendMessage"] = "unsupported"
         await self.open("today", user_id=99, message_id=42)
-        self.assertEqual(self.methods(), ["SendMessage", "AnswerCallbackQuery"])
+        self.assertEqual(self.methods(), ["DeleteEphemeralMessage", "SendMessage", "AnswerCallbackQuery"])
         self.assertTrue(self.session.calls[-1].show_alert)
         self.assertIn("закреплённого меню темы", self.session.calls[-1].text)
-        self.assertEqual(storage.get_topic_screen(-1007, 2, 99), (101, False))
+        self.assertIsNone(storage.get_topic_screen(-1007, 2, 99))
         self.assertLessEqual(schedule.telegram_length(self.session.calls[-1].text), 200)
 
     async def test_repeated_pin_click_opens_screen_in_current_client_and_retires_old_screen(self):
@@ -444,9 +448,10 @@ class TopicInterfaceTests(RouterCase):
         storage.init_db()
         self.session.calls.clear()
         await self.open("schedule", user_id=99, message_id=42, callback_id="current-client")
-        self.assertEqual(self.methods(), ["SendMessage", "DeleteEphemeralMessage", "AnswerCallbackQuery"])
-        self.assertEqual(self.session.calls[0].ephemeral_message_parameters.callback_query_id, "current-client")
-        self.assertEqual(self.session.calls[1].ephemeral_message_id, 101)
+        self.assertEqual(self.methods(), ["DeleteEphemeralMessage", "SendMessage", "AnswerCallbackQuery"])
+        self.assertEqual(self.session.calls[0].ephemeral_message_id, 101)
+        self.assertEqual(self.session.calls[1].ephemeral_message_parameters.callback_query_id, "current-client")
+        self.assertTrue(self.session.calls[1].ephemeral_message_parameters.replace_callback_query_message)
         self.assertEqual(storage.get_topic_screen(-1007, 2, 99), (102, False))
         self.session.calls.clear()
         await self.open("main", user_id=99, ephemeral_id=88)
@@ -483,7 +488,7 @@ class TopicInterfaceTests(RouterCase):
         self.assertEqual(self.methods(), ["SendRichMessage", "SendMessage", "AnswerCallbackQuery"])
         fallback = self.session.calls[1]
         self.assertIn("Химия", fallback.text)
-        self.assertFalse(fallback.ephemeral_message_parameters.replace_callback_query_message)
+        self.assertTrue(fallback.ephemeral_message_parameters.replace_callback_query_message)
         self.assertEqual(fallback.ephemeral_message_parameters.callback_query_id, "99")
 
     async def test_brand_and_callback_sizes(self):
