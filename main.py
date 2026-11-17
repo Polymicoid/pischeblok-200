@@ -20,7 +20,7 @@ import group_interface
 from config import ConfigError, load_config
 from schedule import (
     ScheduleHTML, format_date_human, format_day_btn, format_schedule_blocks,
-    format_updated_human, get_now, get_target_date, telegram_length, truncate_plain,
+    format_updated_human, get_now, get_target_date, telegram_length,
 )
 from storage import (
     bind_topic, clear_subject_rooms, delete_schedule, get_all_subject_rooms,
@@ -34,7 +34,6 @@ SPECIAL_ADMIN_ID = 5270827158
 BOT_USERNAME = ""
 MESSAGE_LIMIT = 4096
 CAPTION_LIMIT = 1024
-ALERT_LIMIT = 200
 
 
 def log(source: str, message: str):
@@ -44,7 +43,7 @@ def log(source: str, message: str):
 class AdminCallbacks(BaseMiddleware):
     async def __call__(self, handler, event: CallbackQuery, data):
         key = event.data or ""
-        if key.startswith(("quick:", "topic:")):
+        if key.startswith("topic:"):
             return await handler(event, data)
         if key.startswith("admin:") and not is_admin(event.from_user.id):
             await event.answer("⛔ Нет доступа.", show_alert=True)
@@ -285,51 +284,6 @@ def build_schedule_view(day_key: str) -> tuple[str, str | None, bool]:
     return format_post_body(date_str, status, content, updated_at), photo_id, True
 
 
-def build_compact_alert_text(day_key: str) -> str:
-    dt = get_target_date(day_key)
-    date_str = dt.strftime("%Y-%m-%d")
-    row = get_schedule(date_str)
-    title = f"📅 {'Сегодня' if day_key == 'today' else 'Завтра'} · {dt:%d.%m}"
-
-    if not row:
-        return f"{title}\n\n⏳ Расписание пока не опубликовано."
-    status, content, _, photo, _, _, _ = row
-    if status == "holiday":
-        return f"{title}\n\n🏖 Выходной · занятий нет"
-    if not content:
-        detail = "📸 Расписание только на фото. Открой «Расписание»." if photo else "⏳ Текст расписания отсутствует."
-        return f"{title}\n\n{detail}"
-
-    clean = ScheduleHTML(content).plain_text()
-    lines = []
-    for block in clean.split("\n\n"):
-        parts = [line.strip() for line in block.splitlines() if line.strip()]
-        if not parts:
-            continue
-        heading = parts[0]
-        if heading.startswith("Классный час"):
-            time = re.search(r"\d\d:\d\d", heading)
-            lines.append(f"{time[0]} · Классный час" if time else heading)
-            continue
-        pair = re.match(r"(\d+)\s+пара(?:\s*\((\d\d:\d\d))?", heading)
-        if not pair or len(parts) < 2:
-            lines.append(truncate_plain(heading, 48))
-            continue
-        label = pair[2] or f"{pair[1]} пара"
-        subject = re.sub(r"^[^\w]+", "", parts[1]).strip() or parts[1]
-        room = f" · {parts[2].removeprefix('📍').strip()}" if len(parts) > 2 else ""
-        lines.append(truncate_plain(f"{label} · {subject}{room}", 52))
-
-    prefix = title + "\n\n"
-    full = prefix + "\n".join(lines)
-    if telegram_length(full) <= ALERT_LIMIT:
-        return full
-    footer = "\n\n… Полное — в «Расписании»"
-    while telegram_length(prefix + "\n".join(lines) + footer) > ALERT_LIMIT:
-        lines.pop()
-    return prefix + "\n".join(lines) + footer
-
-
 # --- ПУБЛИКАЦИЯ В ТЕМУ СУПЕРГРУППЫ ---
 async def sync_schedule_to_topic(
     bot: Bot,
@@ -501,20 +455,12 @@ async def cb_topic_screen(callback: CallbackQuery, bot: Bot):
         await group_interface.show_screen(callback, bot, message, screen, BOT_USERNAME, thread_id)
     except TelegramAPIError as error:
         LOGGER.warning("Персональный экран недоступен (%s)", type(error).__name__)
-        fallback = (
-            build_compact_alert_text(screen) if screen in group_interface.DAYS
-            else "Персональный экран недоступен. В закреплённом меню есть «Быстро» и ссылка на бота."
+        await callback.answer(
+            "Не удалось открыть экран. Попробуй ещё раз или выбери «Открыть бота в ЛС» в закрепе.",
+            show_alert=True,
         )
-        await callback.answer(fallback, show_alert=True)
     else:
         await callback.answer()
-
-
-@router.callback_query(F.data.startswith("quick:"))
-async def cb_quick_view(callback: CallbackQuery):
-    day_key = callback.data.split(":")[1]
-    alert_text = build_compact_alert_text(day_key)
-    await callback.answer(alert_text, show_alert=True)
 
 
 @router.inline_query()

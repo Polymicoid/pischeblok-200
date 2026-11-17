@@ -38,11 +38,7 @@ def menu_keyboard(username: str, *, pinned: bool = False) -> InlineKeyboardMarku
     sections = [button(title, key) for key, (title, _) in SECTIONS.items()]
     rows = [[button("📅 Расписание", "schedule")], sections[:2], sections[2:]]
     if pinned:
-        rows.extend([
-            [InlineKeyboardButton(text=f"👀 Быстро: {label}", callback_data=f"quick:{day}")
-             for day, label in (("today", "сегодня"), ("tomorrow", "завтра"))],
-            [InlineKeyboardButton(text="💬 Открыть бота в ЛС", url=f"https://t.me/{username}?start=schedule")],
-        ])
+        rows.append([InlineKeyboardButton(text="💬 Открыть бота в ЛС", url=f"https://t.me/{username}?start=schedule")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -127,7 +123,9 @@ async def show_screen(
         "receiver_user_id": user_id,
         "ephemeral_message_id": active_id,
     }
-    if active_id and active_has_photo == bool(photo):
+    # Из закрепа отправляем экран клиенту, который нажал кнопку. Правка старого
+    # экрана может пройти на сервере, даже если клиент больше его не показывает.
+    if clicked_id and active_id and active_has_photo == bool(photo):
         try:
             if photo:
                 media = InputMediaPhoto(media=photo, caption=caption, parse_mode="HTML")

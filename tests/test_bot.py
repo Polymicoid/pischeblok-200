@@ -75,7 +75,7 @@ class ScheduleTests(DatabaseCase, unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 schedule.format_schedule_blocks(raw, "2026-11-16", False)
 
-    def test_statuses_and_alert_limit(self):
+    def test_schedule_statuses(self):
         day = "2026-11-16"
         self.assertIn("не опубликовано", main.build_schedule_view("today")[0])
         storage.save_schedule(day, "holiday")
@@ -85,7 +85,6 @@ class ScheduleTests(DatabaseCase, unittest.TestCase):
         self.assertIn("1 пара", text)
         self.assertEqual(photo, "photo")
         self.assertTrue(has_schedule)
-        self.assertLessEqual(schedule.telegram_length(main.build_compact_alert_text("today")), 200)
         safe = schedule.ScheduleHTML("<b>Математика</b><a href='https://example.org'> &lt;3</a>")
         self.assertEqual(safe.limited(100), "<b>Математика</b> &lt;3")
         storage.delete_schedule(day)
@@ -265,15 +264,13 @@ class RouterTests(RouterCase):
         self.assertLess(methods.index("SendMessage"), methods.index("DeleteMessage"))
         self.assertEqual(storage.get_schedule("2026-11-16")[4], self.session.message_id)
 
-    async def test_photo_only_preview_and_quick_view(self):
+    async def test_photo_only_preview_and_publication(self):
         await self.feed(action="admin:edit:tomorrow:2026-11-17", user_id=22)
         await self.feed(photo=True, user_id=22, message_id=11)
         await self.feed(action="admin:only_photo", user_id=22, message_id=self.session.message_id)
         await self.feed(action="admin:confirm:bot", user_id=22, message_id=self.session.message_id)
         row = storage.get_schedule("2026-11-17")
         self.assertEqual((row[0], row[1], row[3]), ("published", None, "photo"))
-        await self.feed(action="quick:tomorrow", group=True, user_id=99)
-        self.assertIn("только на фото", self.session.calls[-1].text)
 
     async def test_inline_sends_schedule_text(self):
         storage.save_schedule("2026-11-16", "published", "<b>Биология</b>")
@@ -297,6 +294,10 @@ class TopicInterfaceTests(RouterCase):
         self.assertIn("ПИЩЕБЛОК-200", menu.text)
         self.assertNotIn("ЛЧПП", menu.text)
         self.assertEqual(menu.reply_markup.inline_keyboard[0][0].callback_data, "topic:schedule")
+        self.assertTrue(all(
+            button.callback_data is None or button.callback_data.startswith("topic:")
+            for row in menu.reply_markup.inline_keyboard for button in row
+        ))
         saved_id = int(storage.get_setting("topic_menu_msg_id"))
         storage.save_schedule("2026-11-16", "published", topic_msg_id=22)
         self.session.calls.clear()
@@ -379,36 +380,29 @@ class TopicInterfaceTests(RouterCase):
         self.assertIn("Выходной", self.session.calls[0].text)
         self.assertEqual(self.session.calls[0].ephemeral_message_parameters.receiver_user_id, 99)
         self.session.calls.clear()
-        self.session.failed_methods["EditEphemeralMessageText"] = "message to edit not found"
         self.session.failed_methods["SendMessage"] = "unsupported"
         await self.open("today", user_id=99, message_id=42)
+        self.assertEqual(self.methods(), ["SendMessage", "AnswerCallbackQuery"])
         self.assertTrue(self.session.calls[-1].show_alert)
-        self.assertIn("Выходной", self.session.calls[-1].text)
+        self.assertIn("Открыть бота в ЛС", self.session.calls[-1].text)
+        self.assertEqual(storage.get_topic_screen(-1007, 2, 99), (101, False))
         self.assertLessEqual(schedule.telegram_length(self.session.calls[-1].text), 200)
 
-    async def test_repeated_pin_click_reuses_saved_screen_and_cleans_legacy_duplicate(self):
+    async def test_repeated_pin_click_opens_screen_in_current_client_and_retires_old_screen(self):
         storage.bind_topic(-1007, 2, 42)
         await self.open("schedule", user_id=99, message_id=42)
         storage.init_db()
         self.session.calls.clear()
-        await self.open("hw", user_id=99, message_id=42)
-        self.assertEqual(self.methods(), ["EditEphemeralMessageText", "AnswerCallbackQuery"])
-        self.assertEqual(self.session.calls[0].ephemeral_message_id, 101)
+        await self.open("schedule", user_id=99, message_id=42, callback_id="current-client")
+        self.assertEqual(self.methods(), ["SendMessage", "DeleteEphemeralMessage", "AnswerCallbackQuery"])
+        self.assertEqual(self.session.calls[0].ephemeral_message_parameters.callback_query_id, "current-client")
+        self.assertEqual(self.session.calls[1].ephemeral_message_id, 101)
+        self.assertEqual(storage.get_topic_screen(-1007, 2, 99), (102, False))
         self.session.calls.clear()
         await self.open("main", user_id=99, ephemeral_id=88)
         self.assertEqual(self.methods(), ["EditEphemeralMessageText", "DeleteEphemeralMessage", "AnswerCallbackQuery"])
-        self.assertEqual(self.session.calls[0].ephemeral_message_id, 101)
+        self.assertEqual(self.session.calls[0].ephemeral_message_id, 102)
         self.assertEqual(self.session.calls[1].ephemeral_message_id, 88)
-
-    async def test_quick_view_uses_a_single_readable_row_per_class(self):
-        storage.save_schedule(
-            "2026-11-16", "published",
-            "<b>1 пара (08:30 – 10:05)</b>\n🧪 Химия\n📍 Каб. 6\n\n"
-            "<b>2 пара (10:35 – 12:10)</b>\n📚 История",
-        )
-        await self.feed(action="quick:today", group=True, user_id=99)
-        self.assertEqual(self.methods(), ["AnswerCallbackQuery"])
-        self.assertEqual(self.session.calls[0].text, "📅 Сегодня · 16.11\n\n08:30 · Химия · Каб. 6\n10:35 · История")
 
     async def test_photo_and_back_to_main_after_reopening_db(self):
         storage.bind_topic(-1007, 2, 42)
