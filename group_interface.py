@@ -1,5 +1,3 @@
-import logging
-
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramNotFound
 from aiogram.types import (
@@ -10,7 +8,6 @@ from aiogram.types import (
 from schedule import ScheduleHTML, build_schedule_view, format_day_btn
 from storage import clear_topic_screen, get_topic_screen, save_topic_screen
 
-LOGGER = logging.getLogger("pischeblok")
 BRAND = "👹 ПИЩЕБЛОК-200 | Учебный помощник"
 PINNED_MENU_TEXT = (
     "👹 <b>ПИЩЕБЛОК-200</b>\n"
@@ -141,27 +138,22 @@ async def show_screen(
             await remove_screen(bot, chat_id, user_id, stale_id)
         return
 
-    async def send_screen(**destination):
-        if photo:
-            try:
-                return await bot.send_rich_message(**destination, **payload, reply_markup=markup)
-            except (TelegramBadRequest, TelegramNotFound):
-                return await bot.send_message(**destination, **photo_fallback, reply_markup=markup)
-        return await bot.send_message(**destination, **payload, reply_markup=markup)
-
-    try:
-        sent = await send_screen(chat_id=None, ephemeral_message_parameters=EphemeralMessageParameters(
-            callback_query_id=callback.id, replace_callback_query_message=True,
-        ))
-    except (TelegramBadRequest, TelegramNotFound) as error:
-        # Повторяем только явный отказ API, чтобы сетевой сбой не создал второй экран.
-        LOGGER.info("Замена закрепа отклонена (%s), открываем отдельный личный экран", type(error).__name__)
-        sent = await send_screen(
-            chat_id=chat_id, message_thread_id=thread_id,
-            ephemeral_message_parameters=EphemeralMessageParameters(
-                receiver_user_id=user_id, callback_query_id=callback.id, replace_callback_query_message=False,
-            ),
-        )
+    # Подмена закрепа может исчезнуть в клиенте даже после успешного ответа API.
+    destination = {
+        "chat_id": chat_id,
+        "message_thread_id": thread_id,
+        "reply_markup": markup,
+        "ephemeral_message_parameters": EphemeralMessageParameters(
+            receiver_user_id=user_id, callback_query_id=callback.id, replace_callback_query_message=False,
+        ),
+    }
+    if photo:
+        try:
+            sent = await bot.send_rich_message(**destination, **payload)
+        except (TelegramBadRequest, TelegramNotFound):
+            sent = await bot.send_message(**destination, **photo_fallback)
+    else:
+        sent = await bot.send_message(**destination, **payload)
 
     if sent.ephemeral_message_id:
         save_topic_screen(*scope, sent.ephemeral_message_id, False)
