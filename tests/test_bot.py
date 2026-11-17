@@ -178,6 +178,8 @@ class FakeSession(BaseSession):
         self.fail_post = False
         self.cannot_edit = False
         self.failed_methods = {}
+        self.callbacks = {}
+        self.reject_replacement = False
         self.message_id = 100
 
     async def close(self):
@@ -197,19 +199,27 @@ class FakeSession(BaseSession):
         if self.cannot_edit and name == "EditMessageText" and method.chat_id < 0:
             raise TelegramBadRequest(method, "there is no text in the message to edit")
         if name in {"SendMessage", "SendPhoto", "SendRichMessage"}:
-            if self.fail_post and method.chat_id < 0:
+            params = method.ephemeral_message_parameters
+            chat_id = method.chat_id
+            if params and chat_id is None:
+                chat_id, user_id = self.callbacks[params.callback_query_id]
+            else:
+                user_id = params.receiver_user_id if params else None
+            if params and params.replace_callback_query_message and self.reject_replacement:
+                raise TelegramBadRequest(method, "cannot replace this message")
+            if self.fail_post and chat_id < 0:
                 raise TelegramBadRequest(method, "test failure")
             self.message_id += 1
             payload = {
                 "message_id": self.message_id,
-                "chat": {"id": method.chat_id, "type": "supergroup" if method.chat_id < 0 else "private"},
+                "chat": {"id": chat_id, "type": "supergroup" if chat_id < 0 else "private"},
                 "date": 1,
             }
-            if params := method.ephemeral_message_parameters:
+            if params:
                 payload.update(
                     message_id=0,
                     ephemeral_message_id=self.message_id,
-                    receiver_user={"id": params.receiver_user_id, "is_bot": False, "first_name": "Тест"},
+                    receiver_user={"id": user_id, "is_bot": False, "first_name": "Тест"},
                 )
             return Message.model_validate(payload, context={"bot": bot})
         return True
@@ -244,8 +254,10 @@ class RouterCase(DatabaseCase, unittest.IsolatedAsyncioTestCase):
             message["photo"] = [{"file_id": "photo", "file_unique_id": "unique", "width": 120, "height": 120}]
         update = {"update_id": 1}
         if action:
+            callback_id = callback_id or str(user_id)
+            self.session.callbacks[callback_id] = (chat["id"], user_id)
             update["callback_query"] = {
-                "id": callback_id or str(user_id), "from": user, "chat_instance": "test",
+                "id": callback_id, "from": user, "chat_instance": "test",
                 "data": action, "message": message,
             }
         elif photo:
@@ -390,9 +402,9 @@ class TopicInterfaceTests(RouterCase):
         )
         await asyncio.gather(*(self.open("schedule", user_id=user, message_id=42) for user in (98, 99)))
         sends = [call for call in self.session.calls if type(call).__name__ == "SendMessage"]
-        self.assertEqual({call.ephemeral_message_parameters.receiver_user_id for call in sends}, {98, 99})
+        self.assertTrue(all(call.ephemeral_message_parameters.receiver_user_id is None for call in sends))
         self.assertEqual({call.ephemeral_message_parameters.callback_query_id for call in sends}, {"98", "99"})
-        self.assertTrue(all(call.message_thread_id == 2 for call in sends))
+        self.assertTrue(all(call.chat_id is None and call.message_thread_id is None for call in sends))
         self.assertTrue(all(call.ephemeral_message_parameters.replace_callback_query_message for call in sends))
         self.session.calls.clear()
         await asyncio.gather(
@@ -434,15 +446,30 @@ class TopicInterfaceTests(RouterCase):
         await self.open("today", user_id=99, message_id=42)
         self.assertEqual(self.methods(), ["SendMessage", "AnswerCallbackQuery"])
         self.assertIn("Выходной", self.session.calls[0].text)
-        self.assertEqual(self.session.calls[0].ephemeral_message_parameters.receiver_user_id, 99)
+        self.assertEqual(self.session.calls[0].ephemeral_message_parameters.callback_query_id, "99")
         self.session.calls.clear()
         self.session.failed_methods["SendMessage"] = "unsupported"
         await self.open("today", user_id=99, message_id=42)
-        self.assertEqual(self.methods(), ["SendMessage", "AnswerCallbackQuery"])
+        self.assertEqual(self.methods(), ["SendMessage", "SendMessage", "AnswerCallbackQuery"])
         self.assertTrue(self.session.calls[-1].show_alert)
         self.assertIn("закреплённого меню темы", self.session.calls[-1].text)
         self.assertEqual(storage.get_topic_screen(-1007, 2, 99), (101, False))
         self.assertLessEqual(schedule.telegram_length(self.session.calls[-1].text), 200)
+
+    async def test_rejected_pin_replacement_falls_back_to_private_screen_and_retires_old_one(self):
+        storage.bind_topic(-1007, 2, 42)
+        storage.save_topic_screen(-1007, 2, 99, 88, False)
+        self.session.reject_replacement = True
+        await self.open("schedule", user_id=99, message_id=42)
+        self.assertEqual(self.methods(), ["SendMessage", "SendMessage", "DeleteEphemeralMessage", "AnswerCallbackQuery"])
+        first, retry, removed, answer = self.session.calls
+        self.assertTrue(first.ephemeral_message_parameters.replace_callback_query_message)
+        self.assertFalse(retry.ephemeral_message_parameters.replace_callback_query_message)
+        self.assertEqual(retry.ephemeral_message_parameters.receiver_user_id, 99)
+        self.assertEqual(retry.message_thread_id, 2)
+        self.assertEqual(removed.ephemeral_message_id, 88)
+        self.assertFalse(answer.show_alert)
+        self.assertEqual(storage.get_topic_screen(-1007, 2, 99), (101, False))
 
     async def test_repeated_pin_click_opens_screen_in_current_client_and_retires_old_screen(self):
         storage.bind_topic(-1007, 2, 42)
@@ -488,7 +515,7 @@ class TopicInterfaceTests(RouterCase):
         fallback = self.session.calls[1]
         self.assertIn("Химия", fallback.text)
         self.assertTrue(fallback.ephemeral_message_parameters.replace_callback_query_message)
-        self.assertEqual(fallback.ephemeral_message_parameters.receiver_user_id, 99)
+        self.assertEqual(fallback.ephemeral_message_parameters.callback_query_id, "99")
 
     async def test_brand_and_callback_sizes(self):
         await self.feed(text="/start", user_id=11)
