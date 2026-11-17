@@ -498,6 +498,7 @@ class TopicInterfaceTests(RouterCase):
         edit = self.session.calls[0]
         self.assertEqual(type(edit).__name__, "EditEphemeralMessageText")
         self.assertEqual(edit.rich_message.media[0].media.media, "photo")
+        self.assertTrue(edit.rich_message.html.startswith('<img src="tg://photo?id=schedule-photo"/>'))
         self.assertEqual(edit.ephemeral_message_id, 101)
         self.assertEqual(edit.reply_markup.inline_keyboard[-2][0].callback_data, "topic:text:today")
         await self.open("text:today", user_id=99, ephemeral_id=101)
