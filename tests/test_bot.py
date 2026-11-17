@@ -155,7 +155,7 @@ class ScheduleTests(DatabaseCase, unittest.TestCase):
             self.assertEqual(storage.get_schedule("2026-11-16"), ("published", "История", "2026-11-15 12:30", None, None, None, 0))
             self.assertEqual(storage.get_timing_int("pair_duration"), 80)
             storage.bind_topic(-1001, 2, 100)
-            storage.set_topic_message("2026-11-16", 5)
+            storage.save_schedule("2026-11-16", "published", "История", topic_msg_id=5)
             storage.bind_topic(-1001, 2, 101)
             self.assertEqual(storage.get_schedule("2026-11-16")[4], 5)
             storage.bind_topic(-1001, 3, 102)
@@ -175,8 +175,6 @@ class FakeSession(BaseSession):
     def __init__(self):
         super().__init__()
         self.calls = []
-        self.fail_post = False
-        self.cannot_edit = False
         self.failed_methods = {}
         self.callbacks = {}
         self.reject_replacement = False
@@ -196,8 +194,6 @@ class FakeSession(BaseSession):
             raise TelegramBadRequest(method, self.failed_methods[name])
         if name == "GetMe":
             return User(id=1, is_bot=True, first_name="Тест", username="test_bot")
-        if self.cannot_edit and name == "EditMessageText" and method.chat_id < 0:
-            raise TelegramBadRequest(method, "there is no text in the message to edit")
         if name in {"SendMessage", "SendPhoto", "SendRichMessage"}:
             params = method.ephemeral_message_parameters
             chat_id = method.chat_id
@@ -207,8 +203,6 @@ class FakeSession(BaseSession):
                 user_id = params.receiver_user_id if params else None
             if params and params.replace_callback_query_message and self.reject_replacement:
                 raise TelegramBadRequest(method, "cannot replace this message")
-            if self.fail_post and chat_id < 0:
-                raise TelegramBadRequest(method, "test failure")
             self.message_id += 1
             payload = {
                 "message_id": self.message_id,
@@ -272,7 +266,7 @@ class RouterCase(DatabaseCase, unittest.IsolatedAsyncioTestCase):
 class RouterTests(RouterCase):
     async def test_non_admin_cannot_use_admin_callbacks_or_bind_topic(self):
         storage.save_schedule("2026-11-15", "published", learned_rooms=(("Биология", "Каб. 12"),))
-        for action in ("admin:menu", "admin:only_photo", "admin:rooms_clear", "admin:confirm:topic",
+        for action in ("admin:menu", "admin:only_photo", "admin:rooms_clear", "admin:confirm:publish",
                        "admin:clear:today:2026-11-16", "admin:setbrk:pair_duration:1"):
             await self.feed(action=action, user_id=99)
             self.assertEqual(self.session.calls[-1].text, "⛔ Нет доступа.")
@@ -291,45 +285,41 @@ class RouterTests(RouterCase):
         await self.feed(action="admin:ch:yes", message_id=20)
         self.assertIn("устарела", self.session.calls[-1].text)
 
-    async def test_publish_saves_before_failed_topic_and_can_retry(self):
+    async def test_publish_shows_one_button_and_updates_only_the_personal_schedule(self):
         storage.bind_topic(-1007, 2, 100)
-        self.session.fail_post = True
         await self.feed(action="admin:edit:today:2026-11-16")
         await self.feed(action="admin:ch:yes")
         await self.feed(text="1. Биология 12", message_id=11)
-        await self.feed(action="admin:confirm:topic", message_id=self.session.message_id)
+        preview = next(call for call in self.session.calls if "Предпросмотр" in (getattr(call, "text", "") or ""))
+        self.assertEqual([row[0].text for row in preview.reply_markup.inline_keyboard], [
+            "✅ Опубликовать", "✏️ Исправить", "❌ Отмена",
+        ])
+        await self.feed(action="admin:confirm:publish", message_id=self.session.message_id)
         row = storage.get_schedule("2026-11-16")
         self.assertEqual(row[0], "published")
         self.assertEqual(row[6], 1)
         self.assertIsNone(row[4])
         self.assertEqual(storage.get_saved_room("Биология"), "Каб. 12")
-        self.session.fail_post = False
-        await self.feed(action="admin:edit:today:2026-11-16")
-        await self.feed(action="admin:ch:yes")
-        await self.feed(text="1. Биология 12", message_id=11)
-        await self.feed(action="admin:confirm:topic", message_id=self.session.message_id)
-        self.assertGreater(storage.get_schedule("2026-11-16")[4], 0)
+        self.assertFalse(any(getattr(call, "chat_id", None) == -1007 for call in self.session.calls))
+        self.session.calls.clear()
+        await self.feed(action="topic:today", user_id=99, group=True, thread_id=2, message_id=100)
+        sent = self.session.calls[0]
+        self.assertIn("Биология", sent.text)
+        self.assertEqual(sent.ephemeral_message_parameters.callback_query_id, "99")
 
-    async def test_photo_to_text_replacement_preserves_old_on_failure(self):
+    async def test_holiday_is_private_and_preserves_legacy_post_reference(self):
         storage.bind_topic(-1007, 2, 100)
         storage.save_schedule("2026-11-16", "published", "Расписание", "old-photo", 42)
-        self.session.cannot_edit = True
-        self.session.fail_post = True
         await self.feed(action="admin:holiday:today:2026-11-16")
-        self.assertEqual(storage.get_schedule("2026-11-16")[4], 42)
-        self.assertFalse(any(type(call).__name__ == "DeleteMessage" for call in self.session.calls))
-        self.session.calls.clear()
-        self.session.fail_post = False
-        await self.feed(action="admin:holiday:today:2026-11-16")
-        methods = [type(call).__name__ for call in self.session.calls]
-        self.assertLess(methods.index("SendMessage"), methods.index("DeleteMessage"))
-        self.assertEqual(storage.get_schedule("2026-11-16")[4], self.session.message_id)
+        row = storage.get_schedule("2026-11-16")
+        self.assertEqual((row[0], row[3], row[4]), ("holiday", None, 42))
+        self.assertFalse(any(getattr(call, "chat_id", None) == -1007 for call in self.session.calls))
 
     async def test_photo_only_preview_and_publication(self):
         await self.feed(action="admin:edit:tomorrow:2026-11-17", user_id=22)
         await self.feed(photo=True, user_id=22, message_id=11)
         await self.feed(action="admin:only_photo", user_id=22, message_id=self.session.message_id)
-        await self.feed(action="admin:confirm:bot", user_id=22, message_id=self.session.message_id)
+        await self.feed(action="admin:confirm:publish", user_id=22, message_id=self.session.message_id)
         row = storage.get_schedule("2026-11-17")
         self.assertEqual((row[0], row[1], row[3]), ("published", None, "photo"))
 

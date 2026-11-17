@@ -25,7 +25,7 @@ from schedule import (
 from storage import (
     bind_topic, clear_subject_rooms, delete_schedule, get_all_subject_rooms,
     get_schedule, get_setting, get_timing_int, get_topic_config, save_schedule,
-    set_setting, set_topic_message, valid_timing,
+    set_setting, valid_timing,
 )
 
 LOGGER = logging.getLogger("pischeblok")
@@ -184,86 +184,12 @@ def kb_admin_cancel_input(day_key: str, allow_only_photo: bool = False) -> Inlin
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def kb_admin_preview(day_key: str, has_topic: bool) -> InlineKeyboardMarkup:
-    rows = []
-    if has_topic:
-        rows.append([InlineKeyboardButton(text="✅ Опубликовать (в боте + в теме)", callback_data="admin:confirm:topic")])
-        rows.append([InlineKeyboardButton(text="🔒 Опубликовать только в боте", callback_data="admin:confirm:bot")])
-    else:
-        rows.append([InlineKeyboardButton(text="✅ Опубликовать", callback_data="admin:confirm:bot")])
-    rows.append([InlineKeyboardButton(text="✏️ Исправить", callback_data=admin_day_action("edit", day_key))])
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=admin_day_action("day", day_key))])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-# --- ПУБЛИКАЦИЯ В ТЕМУ СУПЕРГРУППЫ ---
-async def sync_schedule_to_topic(
-    bot: Bot,
-    date_str: str,
-    status: str,
-    content: str | None,
-    photo_id: str | None,
-    old_topic_msg_id: int | None,
-) -> tuple[int | None, str | None]:
-    chat_id, thread_id = get_topic_config()
-    if not chat_id:
-        return None, "Тема группы не привязана (/set_topic)."
-
-    upd = get_now().strftime("%Y-%m-%d %H:%M")
-    post_text = ScheduleHTML(format_post_body(date_str, status, content, upd)).limited(
-        CAPTION_LIMIT if photo_id else MESSAGE_LIMIT,
-    )
-
-    try:
-        if old_topic_msg_id:
-            try:
-                if photo_id:
-                    await bot.edit_message_media(
-                        chat_id=chat_id,
-                        message_id=old_topic_msg_id,
-                        media=InputMediaPhoto(media=photo_id, caption=post_text, parse_mode="HTML"),
-                    )
-                else:
-                    await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=old_topic_msg_id,
-                        text=post_text,
-                        parse_mode="HTML",
-                    )
-                log("📢 Тема группы", f"обновлён пост за {date_str} (msg #{old_topic_msg_id})")
-                return old_topic_msg_id, None
-            except TelegramBadRequest as e:
-                if "message is not modified" in str(e):
-                    return old_topic_msg_id, None
-
-        if photo_id:
-            sent = await bot.send_photo(
-                chat_id=chat_id,
-                message_thread_id=thread_id,
-                photo=photo_id,
-                caption=post_text,
-                parse_mode="HTML",
-            )
-            log("📢 Тема группы", f"отправлен НОВЫЙ ФОТО-пост за {date_str} (msg #{sent.message_id})")
-        else:
-            sent = await bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=thread_id,
-                text=post_text,
-                parse_mode="HTML",
-            )
-            log("📢 Тема группы", f"отправлен НОВЫЙ пост за {date_str} (msg #{sent.message_id})")
-        set_topic_message(date_str, sent.message_id)
-        if old_topic_msg_id:
-            try:
-                await bot.delete_message(chat_id=chat_id, message_id=old_topic_msg_id)
-            except TelegramAPIError as error:
-                LOGGER.warning("Старый пост остался в теме (%s)", type(error).__name__)
-        return sent.message_id, None
-
-    except TelegramAPIError as error:
-        LOGGER.warning("Ошибка публикации в тему (%s)", type(error).__name__)
-        return old_topic_msg_id, "Проверь привязку темы и права бота."
+def kb_admin_preview(day_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Опубликовать", callback_data="admin:confirm:publish")],
+        [InlineKeyboardButton(text="✏️ Исправить", callback_data=admin_day_action("edit", day_key))],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=admin_day_action("day", day_key))],
+    ])
 
 
 # --- РОУТЕР И ХЭНДЛЕРЫ ---
@@ -529,22 +455,15 @@ async def cb_admin_day(callback: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data.regexp(r"^admin:holiday:(today|tomorrow)(?::[0-9-]+)?$"))
-async def cb_admin_holiday(callback: CallbackQuery, bot: Bot):
+async def cb_admin_holiday(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     day_key = callback.data.split(":")[2]
     date_str = callback.data.rsplit(":", 1)[-1]
 
-    old_row = get_schedule(date_str)
-    old_topic_msg_id = old_row[4] if old_row else None
     save_schedule(date_str, "holiday")
-    _, err = await sync_schedule_to_topic(bot, date_str, "holiday", None, None, old_topic_msg_id)
     log("👑 Староста", f"поставил ВЫХОДНОЙ на {date_str}")
-
-    if err:
-        await callback.answer(f"🏖 Выходной сохранён в боте, но в тему не ушло:\n{err[:140]}", show_alert=True)
-    else:
-        await callback.answer("🏖 Установлен статус «Выходной / занятий нет»", show_alert=True)
+    await callback.answer("🏖 Установлен статус «Выходной / занятий нет»", show_alert=True)
 
     current_text, _, has_sched = build_schedule_view(day_key)
     await render_screen(
@@ -754,7 +673,6 @@ async def show_admin_preview(
     state: FSMContext,
     bot: Bot,
 ):
-    chat_topic_id, _ = get_topic_config()
     now_str = get_now().strftime("%Y-%m-%d %H:%M")
     preview_body = format_post_body(date_str, "published", content, now_str)
     preview_text = f"👀 <b>Предпросмотр:</b>\n\n{preview_body}"
@@ -764,27 +682,26 @@ async def show_admin_preview(
             chat_id=chat_id,
             photo=photo_id,
             caption=preview_text,
-            reply_markup=kb_admin_preview(day_key, bool(chat_topic_id)),
+            reply_markup=kb_admin_preview(day_key),
             parse_mode="HTML",
         )
     else:
         sent = await bot.send_message(
             chat_id=chat_id,
             text=preview_text,
-            reply_markup=kb_admin_preview(day_key, bool(chat_topic_id)),
+            reply_markup=kb_admin_preview(day_key),
             parse_mode="HTML",
         )
     await state.update_data(menu_msg_id=sent.message_id)
     await remove_private_menu(bot, chat_id, menu_msg_id)
 
 
-@router.callback_query(F.data.in_({"admin:confirm:bot", "admin:confirm:topic"}), AdminStates.confirm_schedule)
-async def cb_admin_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot):
+@router.callback_query(F.data == "admin:confirm:publish", AdminStates.confirm_schedule)
+async def cb_admin_confirm(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Нет доступа.", show_alert=True)
         return
 
-    mode = callback.data.split(":")[2]
     data = await state.get_data()
     day_key = data["day_key"]
     date_str = data["date_str"]
@@ -793,29 +710,13 @@ async def cb_admin_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot)
     photo_id = data.get("photo_id")
     has_ch = 1 if data.get("has_class_hour") else 0
     learned_rooms = tuple(data.get("learned_rooms", ()))
-    old_row = get_schedule(date_str)
-    old_topic_msg_id = old_row[4] if old_row else None
     save_schedule(
-        date_str, "published", draft_content, photo_id, old_topic_msg_id,
-        raw_content, has_ch, learned_rooms,
+        date_str, "published", draft_content, photo_id,
+        raw_content=raw_content, has_class_hour=has_ch, learned_rooms=learned_rooms,
     )
     await state.clear()
-    topic_err = None
-
-    if mode == "topic":
-        _, topic_err = await sync_schedule_to_topic(
-            bot, date_str, "published", draft_content, photo_id, old_topic_msg_id
-        )
-
-
-    log("👑 Староста", f"опубликовал расписание на {date_str} (в тему={'Да' if mode == 'topic' and not topic_err else 'Нет'})")
-
-    if topic_err:
-        await callback.answer(f"⚠️ В боте сохранено, но в тему не отправилось:\n{topic_err[:130]}", show_alert=True)
-    elif mode == "topic":
-        await callback.answer("✅ Опубликовано в боте и в теме!", show_alert=True)
-    else:
-        await callback.answer("✅ Опубликовано только в боте!", show_alert=True)
+    log("👑 Староста", f"опубликовал расписание на {date_str}")
+    await callback.answer("✅ Опубликовано. Студенты увидят расписание в своём окне.", show_alert=True)
 
     current_text, current_photo, has_sched = build_schedule_view(day_key)
     await render_screen(

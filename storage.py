@@ -193,14 +193,6 @@ def clear_topic_screen(chat_id: int, thread_key: int, user_id: int):
         )
 
 
-def set_topic_message(date_str: str, message_id: int):
-    with connection() as conn:
-        conn.execute(
-            "UPDATE schedules SET topic_msg_id = ? WHERE date_str = ?",
-            (message_id, date_str),
-        )
-
-
 def get_schedule(date_str: str):
     with connection() as conn:
         return conn.execute(
