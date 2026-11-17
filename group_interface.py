@@ -29,7 +29,8 @@ SECTIONS = {
     "news": ("📢 Объявления", "Здесь будут важные новости группы и изменения в учебных планах."),
 }
 DAYS = {"today", "tomorrow"}
-SCREENS = {"main", "schedule", *DAYS, *SECTIONS}
+TEXT_SCREENS = {f"text:{day}" for day in DAYS}
+SCREENS = {"main", "schedule", *DAYS, *TEXT_SCREENS, *SECTIONS}
 
 
 def section_text(section: str) -> str:
@@ -41,26 +42,28 @@ def button(text: str, screen: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=f"topic:{screen}")
 
 
-def menu_keyboard(username: str, *, pinned: bool = False) -> InlineKeyboardMarkup:
+def menu_keyboard() -> InlineKeyboardMarkup:
     sections = [button(title, key) for key, (title, _) in SECTIONS.items()]
     rows = [[button("📅 Расписание", "schedule")], sections[:2], sections[2:]]
-    if pinned:
-        rows.append([InlineKeyboardButton(text="💬 Открыть бота в ЛС", url=f"https://t.me/{username}?start=schedule")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def render(screen: str, username: str) -> tuple[str, str | None, InlineKeyboardMarkup]:
+def render(screen: str) -> tuple[str, str | None, InlineKeyboardMarkup]:
     if screen == "main":
-        return MENU, None, menu_keyboard(username)
+        return MENU, None, menu_keyboard()
 
     back = [button("⬅️ Главное меню", "main")]
     if screen in SECTIONS:
         return section_text(screen), None, InlineKeyboardMarkup(inline_keyboard=[back])
 
     rows = [[button(format_day_btn("today"), "today"), button(format_day_btn("tomorrow"), "tomorrow")]]
-    if screen in DAYS:
-        text, photo, _ = build_schedule_view(screen)
+    day = screen.removeprefix("text:")
+    if day in DAYS:
+        text, photo, _ = build_schedule_view(day)
         rows.append([button("🔄 Обновить", screen), button("⬅️ К расписанию", "schedule")])
+        if photo and screen in TEXT_SCREENS:
+            rows.append([button("📸 К фото", day)])
+            photo = None
     else:
         text, photo = "📅 <b>Расписание</b>\n\nВыбери день.", None
     return text, photo, InlineKeyboardMarkup(inline_keyboard=[*rows, back])
@@ -77,17 +80,17 @@ async def remove_screen(bot: Bot, chat_id: int, user_id: int, screen_id: int):
 
 
 async def show_screen(
-    callback: CallbackQuery, bot: Bot, message: Message, screen: str, username: str, thread_id: int | None,
+    callback: CallbackQuery, bot: Bot, message: Message, screen: str, thread_id: int | None,
 ):
-    text, photo, markup = render(screen, username)
+    text, photo, markup = render(screen)
     safe = ScheduleHTML(text)
     # Telegram сжимает интервалы между Rich-параграфами. HTML сохраняет пустые строки.
     text = safe.limited(4096)
-    caption = safe.limited(1024, "\n… Открой полное расписание в ЛС.")
+    caption = safe.limited(1024, "\n… Полный текст доступен по кнопке ниже.")
     if photo and telegram_length(safe.plain_text()) > 1024:
         markup = InlineKeyboardMarkup(inline_keyboard=[
             *markup.inline_keyboard,
-            [InlineKeyboardButton(text="💬 Полный текст в ЛС", url=f"https://t.me/{username}?start={screen}")],
+            [button("📄 Полный текст", f"text:{screen}")],
         ])
 
     chat_id, user_id = message.chat.id, callback.from_user.id
@@ -134,13 +137,9 @@ async def show_screen(
             sent = await bot.send_photo(**send, photo=photo, caption=caption, parse_mode="HTML")
         except (TelegramBadRequest, TelegramNotFound):
             sent_photo = False
-            hint = "\n\n📸 Фото временно недоступно. Попробуй открыть его в ЛС."
-            markup = InlineKeyboardMarkup(inline_keyboard=[
-                *markup.inline_keyboard,
-                [InlineKeyboardButton(text="💬 Фото в ЛС", url=f"https://t.me/{username}?start={screen}")],
-            ])
+            hint = "\n\n📸 Фото временно недоступно. Нажми «Обновить», чтобы повторить попытку."
             sent = await bot.send_message(
-                **(send | {"reply_markup": markup}),
+                **send,
                 text=ScheduleHTML(text + hint).limited(4096), parse_mode="HTML",
             )
     else:

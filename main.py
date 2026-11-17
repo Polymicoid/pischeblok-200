@@ -6,7 +6,7 @@ from datetime import date
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramConflictError
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.methods import GetUpdates
@@ -31,7 +31,6 @@ from storage import (
 LOGGER = logging.getLogger("pischeblok")
 ADMIN_IDS: frozenset[int] = frozenset()
 SPECIAL_ADMIN_ID = 5270827158
-BOT_USERNAME = ""
 MESSAGE_LIMIT = 4096
 CAPTION_LIMIT = 1024
 
@@ -45,7 +44,7 @@ class AdminCallbacks(BaseMiddleware):
         key = event.data or ""
         if key.startswith("topic:"):
             return await handler(event, data)
-        if key.startswith("admin:") and not is_admin(event.from_user.id):
+        if not is_admin(event.from_user.id):
             await event.answer("⛔ Нет доступа.", show_alert=True)
             return
         if not isinstance(event.message, Message) or event.message.chat.type != "private":
@@ -112,51 +111,6 @@ async def render_screen(message: Message, text: str, reply_markup: InlineKeyboar
 
 
 # --- КЛАВИАТУРЫ ---
-def kb_main_menu(user_id: int) -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton(text="📅 Расписание", callback_data="menu:schedule")],
-        [
-            InlineKeyboardButton(text="📝 Домашние задания", callback_data="stub:hw"),
-            InlineKeyboardButton(text="📚 Конспекты", callback_data="stub:notes"),
-        ],
-        [
-            InlineKeyboardButton(text="📖 Учебники и методички", callback_data="stub:books"),
-            InlineKeyboardButton(text="📢 Объявления", callback_data="stub:news"),
-        ],
-    ]
-    if is_admin(user_id):
-        buttons.append([InlineKeyboardButton(text="🔐 Панель старосты (Админка)", callback_data="admin:menu")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def kb_schedule_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=f"📌 {format_day_btn('today')}", callback_data="sched:today"),
-            InlineKeyboardButton(text=f"➡️ {format_day_btn('tomorrow')}", callback_data="sched:tomorrow"),
-        ],
-        [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="menu:main")],
-    ])
-
-
-def kb_schedule_view(day_key: str) -> InlineKeyboardMarkup:
-    other_key = "tomorrow" if day_key == "today" else "today"
-    other_text = "➡️ На завтра" if day_key == "today" else "⬅️ На сегодня"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=other_text, callback_data=f"sched:{other_key}"),
-            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"sched:{day_key}"),
-        ],
-        [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="menu:main")],
-    ])
-
-
-def kb_stub_back() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="menu:main")]
-    ])
-
-
 def kb_admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"📅 Управление: {format_day_btn('today')}", callback_data=admin_day_action("day", "today"))],
@@ -240,10 +194,6 @@ def kb_admin_preview(day_key: str, has_topic: bool) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="✏️ Исправить", callback_data=admin_day_action("edit", day_key))])
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=admin_day_action("day", day_key))])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-# --- СБОРКА ТЕКСТА РАСПИСАНИЯ ---
-MAIN_MENU_TEXT = group_interface.MENU
 
 
 # --- ПУБЛИКАЦИЯ В ТЕМУ СУПЕРГРУППЫ ---
@@ -346,7 +296,7 @@ async def cmd_set_topic(message: Message, bot: Bot):
     new_menu_id = None
     menu = {
         "text": group_interface.PINNED_MENU_TEXT, "parse_mode": "HTML",
-        "reply_markup": group_interface.menu_keyboard(BOT_USERNAME, pinned=True),
+        "reply_markup": group_interface.menu_keyboard(),
     }
     notice = "✅ Тема привязана. Меню закреплено."
     try:
@@ -412,102 +362,43 @@ async def cb_topic_screen(callback: CallbackQuery, bot: Bot):
         return
 
     try:
-        await group_interface.show_screen(callback, bot, message, screen, BOT_USERNAME, thread_id)
+        await group_interface.show_screen(callback, bot, message, screen, thread_id)
     except TelegramAPIError as error:
         LOGGER.warning("Персональный экран недоступен (%s)", type(error).__name__)
         await callback.answer(
-            "Не удалось открыть экран. Попробуй ещё раз или выбери «Открыть бота в ЛС» в закрепе.",
+            "Не удалось открыть экран. Попробуй ещё раз из закреплённого меню темы.",
             show_alert=True,
         )
     else:
         await callback.answer()
 
 
-# --- ЛИЧНЫЕ СООБЩЕНИЯ ---
-@router.message(CommandStart(), F.chat.type == "private")
-async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
-    await state.clear()
-    arg = command.args
-
-    if arg in group_interface.DAYS:
-        text, photo, _ = build_schedule_view(arg)
-        keyboard = kb_schedule_view(arg)
-        if photo:
-            caption = ScheduleHTML(text).limited(CAPTION_LIMIT)
-            await message.answer_photo(photo, caption=caption, reply_markup=keyboard, parse_mode="HTML")
-            if telegram_length(ScheduleHTML(text).plain_text()) > CAPTION_LIMIT:
-                await message.answer(ScheduleHTML(text).limited(MESSAGE_LIMIT), parse_mode="HTML")
-        else:
-            await message.answer(ScheduleHTML(text).limited(MESSAGE_LIMIT), reply_markup=keyboard, parse_mode="HTML")
-        return
-    if arg == "schedule":
-        text = "📅 <b>Раздел «Расписание»</b>\n\nВыбери день, на который хочешь посмотреть пары:"
-        await message.answer(text, reply_markup=kb_schedule_menu(), parse_mode="HTML")
-        return
-
-    if arg in group_interface.SECTIONS:
-        await message.answer(
-            group_interface.section_text(arg),
-            reply_markup=kb_stub_back(),
-            parse_mode="HTML",
-        )
-        return
-
-    await message.answer(MAIN_MENU_TEXT, reply_markup=kb_main_menu(message.from_user.id), parse_mode="HTML")
-
-
-@router.callback_query(F.data == "menu:main")
-async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await render_screen(callback.message, MAIN_MENU_TEXT, kb_main_menu(callback.from_user.id))
-    await callback.answer()
-
-
-@router.callback_query(F.data == "menu:schedule")
-async def cb_schedule_menu(callback: CallbackQuery):
-    text = "📅 <b>Раздел «Расписание»</b>\n\nВыбери день, на который хочешь посмотреть пары:"
-    await render_screen(callback.message, text, kb_schedule_menu())
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("sched:"))
-async def cb_view_schedule(callback: CallbackQuery):
-    day_key = callback.data.split(":")[1]
-    text, photo_id, _ = build_schedule_view(day_key)
-    await render_screen(
-        callback.message,
-        text,
-        kb_schedule_view(day_key),
-        photo_id=photo_id,
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("stub:"))
-async def cb_stub(callback: CallbackQuery):
-    key = callback.data.split(":")[1]
-    text = group_interface.section_text(key) if key in group_interface.SECTIONS else "Раздел недоступен."
-    await render_screen(callback.message, text, kb_stub_back())
-    await callback.answer()
-
-
 # --- АДМИНКА ---
-@router.callback_query(F.data == "admin:menu")
-async def cb_admin_menu(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Нет доступа.", show_alert=True)
+@router.message(CommandStart(), F.chat.type == "private")
+async def cmd_start(message: Message, state: FSMContext):
+    if not message.from_user or not is_admin(message.from_user.id):
+        await message.answer("Личный чат доступен старостам. Расписание открывается из закрепа в теме группы.")
         return
     await state.clear()
+    await message.answer(admin_menu_text(message.from_user.id), reply_markup=kb_admin_menu(), parse_mode="HTML")
+
+
+def admin_menu_text(user_id: int) -> str:
     chat_id, _ = get_topic_config()
     topic_status = "🟢 Тема группы привязана" if chat_id else "⚪️ Тема не привязана (напиши /set_topic в нужной теме)"
 
-    if callback.from_user.id == SPECIAL_ADMIN_ID:
+    if user_id == SPECIAL_ADMIN_ID:
         header = "🔥 <b>Привет, ты сегодня на все 100 (градусов)!</b>"
     else:
         header = "🔐 <b>Панель старосты</b>"
 
-    text = f"{header}\n{group_interface.BRAND}\n\n{topic_status}\n\nВыбери действие:"
-    await render_screen(callback.message, text, kb_admin_menu())
+    return f"{header}\n{group_interface.BRAND}\n\n{topic_status}\n\nВыбери действие:"
+
+
+@router.callback_query(F.data == "admin:menu")
+async def cb_admin_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await render_screen(callback.message, admin_menu_text(callback.from_user.id), kb_admin_menu())
     await callback.answer()
 
 
@@ -937,13 +828,12 @@ async def stale_callback(callback: CallbackQuery):
 
 
 async def main():
-    global ADMIN_IDS, BOT_USERNAME
+    global ADMIN_IDS
     token, ADMIN_IDS, storage.DB_PATH = load_config()
     storage.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with storage.polling_lock(storage.DB_PATH):
         storage.init_db()
         async with Bot(token=token) as bot:
-            BOT_USERNAME = (await bot.get_me()).username
             await bot.delete_webhook(drop_pending_updates=False)
             dispatcher = Dispatcher()
             dispatcher.include_router(router)

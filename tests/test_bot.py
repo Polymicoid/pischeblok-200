@@ -99,7 +99,7 @@ class ScheduleTests(DatabaseCase, unittest.TestCase):
         self.assertEqual(rooms, [("Математика", "Каб. 12")])
         legacy = "<b>1 пара (08:30 – 10:05)</b>\n📚 География\n📍 Каб. 3\n\n<b>2 пара</b>\n⏸ Окно / нет пары"
         storage.save_schedule("2026-11-16", "published", legacy)
-        for view in (main.build_schedule_view, lambda day: main.group_interface.render(day, "test_bot")):
+        for view in (main.build_schedule_view, main.group_interface.render):
             text = view("today")[0]
             self.assertIn("🌍 География", text)
             self.assertIn("❌ Окно / нет пары", text)
@@ -118,7 +118,7 @@ class ScheduleTests(DatabaseCase, unittest.TestCase):
             self.assertIn("🌐 Иностранный язык\n📍 Немецкий — каб. 13 · Английский — каб. 17", text)
             self.assertEqual(rooms, [])
             self.assertEqual(schedule.refresh_subjects(text), text)
-        view = main.group_interface.render("today", "test_bot")[0]
+        view = main.group_interface.render("today")[0]
         self.assertEqual(view, main.build_schedule_view("today")[0])
         self.assertIn("<b>1 пара (08:30 – 10:05)</b>\n📐 Математика", view)
         self.assertIn("🌐 Иностранный язык\n📍 Немецкий — каб. 13 · Английский — каб. 17", view)
@@ -218,7 +218,6 @@ class FakeSession(BaseSession):
 class RouterCase(DatabaseCase, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.enterContext(patch.object(main, "ADMIN_IDS", frozenset({11, 22})))
-        self.enterContext(patch.object(main, "BOT_USERNAME", "test_bot"))
         self.session = FakeSession()
         self.bot = Bot(token="1:offline-test-value", session=self.session)
         self.dispatcher = Dispatcher()
@@ -350,7 +349,7 @@ class TopicInterfaceTests(RouterCase):
         self.assertNotIn("ЛЧПП", menu.text)
         self.assertEqual(menu.reply_markup.inline_keyboard[0][0].callback_data, "topic:schedule")
         self.assertTrue(all(
-            button.callback_data is None or button.callback_data.startswith("topic:")
+            button.callback_data and button.callback_data.startswith("topic:") and not button.url
             for row in menu.reply_markup.inline_keyboard for button in row
         ))
         saved_id = int(storage.get_setting("topic_menu_msg_id"))
@@ -439,7 +438,7 @@ class TopicInterfaceTests(RouterCase):
         await self.open("today", user_id=99, message_id=42)
         self.assertEqual(self.methods(), ["SendMessage", "AnswerCallbackQuery"])
         self.assertTrue(self.session.calls[-1].show_alert)
-        self.assertIn("Открыть бота в ЛС", self.session.calls[-1].text)
+        self.assertIn("закреплённого меню темы", self.session.calls[-1].text)
         self.assertEqual(storage.get_topic_screen(-1007, 2, 99), (101, False))
         self.assertLessEqual(schedule.telegram_length(self.session.calls[-1].text), 200)
 
@@ -469,12 +468,14 @@ class TopicInterfaceTests(RouterCase):
         self.assertEqual(sent.photo, "photo")
         self.assertEqual(sent.ephemeral_message_parameters.receiver_user_id, 99)
         self.assertLessEqual(schedule.telegram_length(schedule.ScheduleHTML(sent.caption).plain_text()), 1024)
-        self.assertEqual(sent.reply_markup.inline_keyboard[-1][0].url, "https://t.me/test_bot?start=today")
-        await self.open("main", user_id=99, ephemeral_id=101, photo=True)
+        self.assertEqual(sent.reply_markup.inline_keyboard[-1][0].callback_data, "topic:text:today")
+        await self.open("text:today", user_id=99, ephemeral_id=101, photo=True)
         self.assertEqual(self.methods()[-3:], ["SendMessage", "DeleteEphemeralMessage", "AnswerCallbackQuery"])
+        self.assertIn("🧪" * 700, self.session.calls[-3].text)
+        self.assertEqual(self.session.calls[-3].reply_markup.inline_keyboard[-2][0].callback_data, "topic:today")
         self.assertNotIn("DeleteMessage", self.methods())
 
-    async def test_photo_failure_preserves_text_and_private_link(self):
+    async def test_photo_failure_preserves_text_in_topic(self):
         storage.bind_topic(-1007, 2, 42)
         storage.save_schedule("2026-11-16", "published", "Химия", "photo")
         self.session.failed_methods["SendPhoto"] = "unsupported photo"
@@ -485,14 +486,26 @@ class TopicInterfaceTests(RouterCase):
         self.assertEqual(fallback.ephemeral_message_parameters.receiver_user_id, 99)
 
     async def test_brand_and_callback_sizes(self):
-        await self.feed(text="/start", user_id=99)
+        await self.feed(text="/start", user_id=11)
         self.assertIn("ПИЩЕБЛОК-200", self.session.calls[0].text)
         self.assertNotIn("ЛЧПП", self.session.calls[0].text)
+        self.assertIn("Панель старосты", self.session.calls[0].text)
         for section in main.group_interface.SCREENS:
-            _, _, markup = main.group_interface.render(section, "test_bot")
+            _, _, markup = main.group_interface.render(section)
             for row in markup.inline_keyboard:
                 for button in row:
                     self.assertLessEqual(len(button.callback_data.encode()), 64)
+
+    async def test_student_private_start_and_old_buttons_do_not_open_menu(self):
+        for command in ("/start", "/start schedule", "/start today"):
+            await self.feed(text=command, user_id=99)
+            self.assertIn("доступен старостам", self.session.calls[-1].text)
+            self.assertIsNone(self.session.calls[-1].reply_markup)
+        self.session.calls.clear()
+        for action in ("menu:main", "menu:schedule", "sched:today", "stub:hw"):
+            await self.feed(action=action, user_id=99)
+            self.assertTrue(self.session.calls[-1].show_alert)
+        self.assertEqual(self.methods(), ["AnswerCallbackQuery"] * 4)
 
 
 class StartupTests(DatabaseCase, unittest.IsolatedAsyncioTestCase):
@@ -503,7 +516,6 @@ class StartupTests(DatabaseCase, unittest.IsolatedAsyncioTestCase):
             patch.object(main, "Bot", return_value=Bot(token="1:offline-test-value", session=session)),
             patch.object(main, "load_config", return_value=("unused", frozenset({11, 22}), storage.DB_PATH)),
             patch.object(main, "ADMIN_IDS", frozenset()),
-            patch.object(main, "BOT_USERNAME", ""),
             patch.object(Dispatcher, "start_polling", new_callable=AsyncMock) as run,
         ):
             self.addCleanup(setattr, main.router, "_parent_router", None)
