@@ -34,14 +34,30 @@ class ScheduleTests(DatabaseCase, unittest.TestCase):
                 parse_admin_ids(invalid)
 
     def test_weekday_saturday_and_class_hour(self):
-        regular = schedule.calculate_pair_times("2026-11-16", False)
+        regular = schedule.calculate_pair_times("2026-11-17", False)
         saturday = schedule.calculate_pair_times("2026-11-21", False)
         special = schedule.calculate_pair_times("2026-11-19", True)
         self.assertEqual((regular[1], regular[2]), ("08:30 – 10:05", "10:35 – 12:10"))
         self.assertEqual(saturday[2], "10:15 – 11:50")
         self.assertEqual(special[1], "09:05 – 10:40")
         storage.set_setting("pair_duration", "60")
-        self.assertEqual(schedule.calculate_pair_times("2026-11-16", False)[1], "08:30 – 09:30")
+        self.assertEqual(schedule.calculate_pair_times("2026-11-17", False)[1], "08:30 – 09:30")
+
+    def test_monday_and_thursday_keep_late_bells_without_class_hour(self):
+        expected = [
+            "09:05 – 10:40", "11:10 – 12:45", "13:15 – 14:50",
+            "15:00 – 16:35", "16:45 – 18:20",
+        ]
+        for day in ("2026-11-16", "2026-11-19", "2026-11-23", "2026-11-26"):
+            for has_class_hour in (False, True):
+                with self.subTest(day=day, has_class_hour=has_class_hour):
+                    times = schedule.calculate_pair_times(day, has_class_hour)
+                    self.assertEqual([times[pair] for pair in range(1, 6)], expected)
+                    text, _ = schedule.format_schedule_blocks("матан\nхимия", day, has_class_hour)
+                    self.assertEqual("Классный час" in text, has_class_hour)
+                    self.assertIn("1 пара (09:05 – 10:40)", text)
+        text, _ = schedule.format_schedule_blocks("10:00–11:35 матан", "2026-11-19", False)
+        self.assertIn("1 пара (10:00 – 11:35)", text)
 
     def test_local_midnight(self):
         real_get_now = self.get_now_function
@@ -260,6 +276,29 @@ class RouterCase(DatabaseCase, unittest.IsolatedAsyncioTestCase):
 
 
 class RouterTests(RouterCase):
+    async def test_class_hour_question_and_no_choice_for_each_monday_and_thursday(self):
+        for day in ("2026-11-16", "2026-11-19", "2026-11-23", "2026-11-26"):
+            with self.subTest(day=day), patch.object(
+                schedule, "get_now", return_value=datetime.fromisoformat(day + "T09:00:00"),
+            ):
+                await self.feed(action=f"admin:edit:today:{day}")
+                question = self.session.calls[-2]
+                self.assertIn("классный час", question.text)
+                self.assertIn("09:05", question.text)
+                self.assertEqual(question.reply_markup.inline_keyboard[1][0].text, "❌ Нет, пары с 09:05")
+                await self.feed(action="admin:ch:no")
+                await self.feed(text="матан", message_id=11)
+                preview = next(
+                    call for call in reversed(self.session.calls)
+                    if "Предпросмотр" in (getattr(call, "text", "") or "")
+                )
+                self.assertIn("1 пара (09:05 – 10:40)", preview.text)
+                self.assertNotIn("🏫 Классный час", preview.text)
+                await self.feed(action="admin:confirm:publish", message_id=self.session.message_id)
+                row = storage.get_schedule(day)
+                self.assertEqual(row[6], 0)
+                self.assertIn("1 пара (09:05 – 10:40)", row[1])
+
     async def test_non_admin_cannot_use_admin_callbacks_or_bind_topic(self):
         storage.save_schedule("2026-11-15", "published", learned_rooms=(("Биология", "Каб. 12"),))
         for action in ("admin:menu", "admin:only_photo", "admin:rooms_clear", "admin:confirm:publish",

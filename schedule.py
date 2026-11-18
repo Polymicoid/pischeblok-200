@@ -77,7 +77,8 @@ def calculate_pair_times(date_str: str, has_class_hour: bool) -> dict[int, str]:
         b2 = get_timing_int("wd_break_2")
         bo = get_timing_int("wd_break_other")
 
-    if has_class_hour:
+    # В понедельник и четверг сетка пар начинается в 09:05 даже при отмене классного часа.
+    if dt.weekday() in (0, 3) or has_class_hour:
         cur = datetime(2000, 1, 1, 9, 5)
     else:
         cur = datetime(2000, 1, 1, 8, 30)

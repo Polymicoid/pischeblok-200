@@ -171,7 +171,7 @@ def kb_admin_day(day_key: str, has_schedule: bool) -> InlineKeyboardMarkup:
 def kb_admin_class_hour(day_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Да, будет классный час (08:30 – 09:00)", callback_data="admin:ch:yes")],
-        [InlineKeyboardButton(text="❌ Нет, пары сразу с 08:30", callback_data="admin:ch:no")],
+        [InlineKeyboardButton(text="❌ Нет, пары с 09:05", callback_data="admin:ch:no")],
         [InlineKeyboardButton(text="⬅️ Отмена", callback_data=admin_day_action("day", day_key))],
     ])
 
@@ -340,7 +340,8 @@ async def cb_admin_breaks(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     text = (
         "⏱ <b>Настройка звонков и перерывов</b>\n\n"
-        "• <b>Будни:</b> начало в 08:30 (с классным часом: кл. час 08:30–09:00, 1 пара с 09:05)\n"
+        "• <b>Понедельник и четверг:</b> 1 пара с 09:05 независимо от классного часа (08:30–09:00).\n"
+        "• <b>Остальные будни:</b> 1 пара с 08:30.\n"
         "• <b>Суббота:</b> начало в 08:30\n\n"
         "Нажми на нужный параметр ниже, чтобы изменить:"
     )
@@ -524,7 +525,8 @@ async def cb_admin_edit(callback: CallbackQuery, state: FSMContext):
         day_name = "понедельник" if dt.weekday() == 0 else "четверг"
         text = (
             f"🔔 <b>Вопрос по расписанию на {format_date_human(date_str)}</b>\n\n"
-            f"В {day_name} будет <b>классный час</b> (08:30 – 09:00)?"
+            f"В {day_name} будет <b>классный час</b> (08:30 – 09:00)?\n\n"
+            "Первая пара в любом случае начинается в <b>09:05</b>."
         )
         msg = await render_screen(callback.message, text, kb_admin_class_hour(day_key))
         await state.update_data(menu_msg_id=msg.message_id)
@@ -554,12 +556,14 @@ async def ask_schedule_input(message: Message, state: FSMContext, day_key: str, 
     if row and row[0] == "published" and row[5]:
         existing_hint = f"\n\n📋 <b>Текущий черновик (нажми, чтобы скопировать):</b>\n<code>{html.escape(row[5])}</code>"
 
-    ch_notice = (
-        "🔔 <b>Классный час (08:30 – 09:00) я подставлю сам — писать его НЕ нужно!</b> "
-        "Начни сразу с 1-й пары (09:05).\n\n"
-        if has_class_hour
-        else ""
-    )
+    ch_notice = ""
+    if has_class_hour:
+        ch_notice = (
+            "🔔 <b>Классный час (08:30 – 09:00) я подставлю сам — писать его НЕ нужно!</b> "
+            "Начни сразу с 1-й пары (09:05).\n\n"
+        )
+    elif date.fromisoformat(date_str).weekday() in (0, 3):
+        ch_notice = "🕘 Первая пара с <b>09:05</b>.\n\n"
 
     text = (
         f"✏️ <b>Ввод расписания на {format_date_human(date_str)}</b>\n\n"
