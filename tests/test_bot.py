@@ -11,6 +11,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message, Update, User
 
 import analytics
+import homework
 import main
 import schedule
 import storage
@@ -245,7 +246,7 @@ class RouterCase(DatabaseCase, unittest.IsolatedAsyncioTestCase):
     async def feed(
         self, *, action=None, text=None, user_id=11, message_id=10, group=False,
         photo=False, thread_id=None, ephemeral_id=None, receiver_id=None,
-        callback_id=None, chat_id=-1007,
+        callback_id=None, chat_id=-1007, document=False, forward_origin=None,
     ):
         user = {"id": user_id, "is_bot": False, "first_name": "Тест"}
         chat = {"id": chat_id if group else user_id, "type": "supergroup" if group else "private"}
@@ -259,6 +260,10 @@ class RouterCase(DatabaseCase, unittest.IsolatedAsyncioTestCase):
             )
         if photo:
             message["photo"] = [{"file_id": "photo", "file_unique_id": "unique", "width": 120, "height": 120}]
+        if document:
+            message["document"] = {"file_id": "file", "file_unique_id": "unique-file", "file_name": "list.pdf"}
+        if forward_origin:
+            message["forward_origin"] = forward_origin
         update = {"update_id": 1}
         if action:
             callback_id = callback_id or str(user_id)
@@ -267,7 +272,7 @@ class RouterCase(DatabaseCase, unittest.IsolatedAsyncioTestCase):
                 "id": callback_id, "from": user, "chat_instance": "test",
                 "data": action, "message": message,
             }
-        elif photo:
+        elif photo or document:
             update["message"] = {
                 **message, "from": user, "caption": text,
             }
@@ -277,6 +282,68 @@ class RouterCase(DatabaseCase, unittest.IsolatedAsyncioTestCase):
 
 
 class RouterTests(RouterCase):
+    async def test_homework_forward_preview_publish_and_edit(self):
+        now = datetime(2026, 11, 16, 21, tzinfo=timezone.utc)
+        self.enterContext(patch.object(main, "get_now", return_value=now))
+        self.enterContext(patch.object(homework, "get_now", return_value=now))
+        storage.bind_topic(-1007, 2, 42)
+        await self.feed(action="admin:hw:new", user_id=99)
+        self.assertIn("Нет доступа", self.session.calls[-1].text)
+
+        await self.feed(action="admin:hw:new")
+        await self.feed(action="admin:hw:step:subject:1")
+        await self.feed(
+            text="На завтра: стр. 12, №3.\nИсточник: https://t.me/c/123/2/8",
+            document=True,
+            forward_origin={"type": "hidden_user", "date": int(now.timestamp()), "sender_user_name": "Тест"},
+        )
+        prompt = self.session.calls[-1]
+        self.assertTrue(any(
+            button.callback_data == "admin:hw:step:due:2026-11-18"
+            for row in prompt.reply_markup.inline_keyboard for button in row
+        ))
+        await self.feed(action="admin:hw:step:due:2026-11-18", message_id=self.session.message_id)
+        self.assertIsNone(homework.get_assignment(1))
+        await self.feed(action="admin:hw:step:save", message_id=self.session.message_id)
+        assignment = homework.get_assignment(1)
+        self.assertEqual((assignment.subject, assignment.document_id, assignment.due_on), (1, "file", "2026-11-18"))
+
+        await self.feed(action="admin:hw:edit:1")
+        await self.feed(action="admin:hw:step:subject:1")
+        await self.feed(action="admin:hw:step:keep")
+        await self.feed(text="20.11.2026")
+        await self.feed(action="admin:hw:step:save", message_id=self.session.message_id)
+        assignment = homework.get_assignment(1)
+        self.assertEqual((assignment.due_on, assignment.document_id), ("2026-11-20", "file"))
+        self.assertEqual(assignment.source_url, "https://t.me/c/123/2/8")
+        self.assertFalse(any(getattr(call, "chat_id", None) == -1007 for call in self.session.calls))
+
+    async def test_homework_archive_filter_and_document_use_the_personal_screen(self):
+        self.enterContext(patch.object(homework, "get_now", return_value=datetime(2026, 11, 16, 9)))
+        storage.bind_topic(-1007, 2, 42)
+        homework.save_assignment(homework.Assignment(subject=1, body="Задача <3", due_on="2026-11-16", document_id="file"))
+        homework.save_assignment(homework.Assignment(subject=2, body="Старое задание", due_on="2026-11-15"))
+        homework.save_assignment(homework.Assignment(subject=0, body="Задание без срока"))
+        topic = dict(user_id=99, group=True, thread_id=2)
+        await self.feed(action="topic:hw", message_id=42, **topic)
+        root = self.session.calls[0]
+        self.assertTrue(root.ephemeral_message_parameters.replace_callback_query_message)
+        self.assertTrue(any("Задача" in row[0].text for row in root.reply_markup.inline_keyboard))
+        self.assertFalse(any("Старое" in row[0].text for row in root.reply_markup.inline_keyboard))
+
+        await self.feed(action="topic:hw:archive:0:0", ephemeral_id=101, **topic)
+        archive = self.session.calls[-2]
+        self.assertTrue(any("Старое" in row[0].text for row in archive.reply_markup.inline_keyboard))
+        await self.feed(action="topic:hw:active:1:0", ephemeral_id=101, **topic)
+        filtered = self.session.calls[-2]
+        self.assertFalse(any("без срока" in row[0].text for row in filtered.reply_markup.inline_keyboard))
+        await self.feed(action="topic:hw:item:1:active:1:0", ephemeral_id=101, **topic)
+        detail = self.session.calls[-2]
+        self.assertEqual(type(detail).__name__, "EditEphemeralMessageText")
+        self.assertEqual(detail.ephemeral_message_id, 101)
+        self.assertEqual(detail.rich_message.media[0].media.media, "file")
+        self.assertIn("Задача &lt;3", detail.rich_message.html)
+
     async def test_weekly_statistics_count_student_requests_and_require_private_admin(self):
         now = datetime(2026, 11, 16, 8)
         with patch.object(main, "get_now", return_value=now), patch.object(analytics, "get_now", return_value=now), patch.object(storage, "get_now", return_value=now):

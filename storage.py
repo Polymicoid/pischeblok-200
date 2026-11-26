@@ -108,6 +108,18 @@ def init_db():
                 published_at TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS homework (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject INTEGER NOT NULL,
+                body TEXT NOT NULL,
+                due_on TEXT,
+                photo_id TEXT,
+                document_id TEXT,
+                source_url TEXT,
+                archived INTEGER NOT NULL DEFAULT 0
+            )
+        """)
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('analytics_secret', ?)",
             (secrets.token_hex(32),),

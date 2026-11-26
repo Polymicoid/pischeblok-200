@@ -2,9 +2,10 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramNotFound
 from aiogram.types import (
     CallbackQuery, EphemeralMessageParameters, InlineKeyboardButton,
-    InlineKeyboardMarkup, InputMediaPhoto, InputRichMessage, InputRichMessageMedia, Message,
+    InlineKeyboardMarkup, InputMediaDocument, InputMediaPhoto, InputRichMessage, InputRichMessageMedia, Message,
 )
 
+import homework
 from schedule import ScheduleHTML, build_schedule_view, format_day_btn
 from storage import clear_topic_screen, get_topic_screen, save_topic_screen
 
@@ -14,7 +15,7 @@ PINNED_MENU_TEXT = (
     "<i>Учебный штаб группы ПКД-1</i>\n\n"
     "🔥 Здесь кипят не только кастрюли, но и дедлайны.\n\n"
     "📅 <b>Расписание</b> всегда под рукой.\n"
-    "📝 <b>Домашка</b>, 📚 <b>конспекты</b> и 📢 <b>объявления</b> скоро появятся в меню.\n\n"
+    "📝 <b>Домашка</b> по предметам и срокам. 📚 <b>Конспекты</b> и 📢 <b>объявления</b> скоро появятся в меню.\n\n"
     "🍳 Всё необходимое для студенческой жизни постепенно собираем в одном месте.\n\n"
     "<b>Наша задача: дожить до диплома и ничего не забыть.</b> 💀\n\n"
     "👇 Выбирай нужный раздел!"
@@ -46,8 +47,22 @@ def menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def render(screen: str) -> tuple[str, str | None, InlineKeyboardMarkup]:
+def render(screen: str) -> tuple[str, str | InputMediaDocument | None, InlineKeyboardMarkup]:
     back = [button("⬅️ В закреп", CLOSE_SCREEN)]
+    if homework.valid_student_screen(screen):
+        item = homework.ITEM_ROUTE.fullmatch(screen)
+        if not item:
+            text, keyboard = homework.list_view(screen)
+            return text, None, keyboard
+        assignment = homework.get_assignment(int(item[1]))
+        rows = [[button("⬅️ К заданиям", f"hw:{item[2]}:{item[3]}:{item[4]}")], back]
+        if assignment is None:
+            return "Задание больше недоступно.", None, InlineKeyboardMarkup(inline_keyboard=rows)
+        source = homework.source_button(assignment)
+        if source:
+            rows.insert(0, source)
+        media = InputMediaDocument(media=assignment.document_id) if assignment.document_id else assignment.photo_id
+        return homework.assignment_text(assignment), media, InlineKeyboardMarkup(inline_keyboard=rows)
     if screen in SECTIONS:
         return section_text(screen), None, InlineKeyboardMarkup(inline_keyboard=[back])
 
@@ -88,13 +103,19 @@ async def close_screen(bot: Bot, message: Message, user_id: int, thread_id: int 
     clear_topic_screen(*scope)
 
 
-def photo_message(text: str, photo: str) -> InputRichMessage:
-    # Встроенное фото можно убрать следующей правкой того же временного сообщения.
+def attachment_message(text: str, attachment: str | InputMediaDocument) -> InputRichMessage:
+    # Вложение можно убрать следующей правкой того же временного сообщения.
     # Клиент сжимает отступы абзацев, поэтому пустая строка задаётся явно.
     lines = text.replace("\n\n", "<br>&#160;<br>").replace("\n", "<br>")
+    if isinstance(attachment, InputMediaDocument):
+        media = InputRichMessageMedia(id="homework-file", media=attachment)
+        block = '<tg-document src="tg://document?id=homework-file"></tg-document>'
+    else:
+        media = InputRichMessageMedia(id="schedule-photo", media=InputMediaPhoto(media=attachment))
+        block = '<img src="tg://photo?id=schedule-photo"/>'
     return InputRichMessage(
-        html=f'<img src="tg://photo?id=schedule-photo"/><p>{lines}</p>',
-        media=[InputRichMessageMedia(id="schedule-photo", media=InputMediaPhoto(media=photo))],
+        html=f"{block}<p>{lines}</p>",
+        media=[media],
         skip_entity_detection=True,
     )
 
@@ -103,13 +124,14 @@ async def show_screen(
     callback: CallbackQuery, bot: Bot, message: Message, screen: str, thread_id: int | None,
 ) -> bool:
     """Возвращает True, если Telegram принял текст вместо фото."""
-    text, photo, markup = render(screen)
+    text, attachment, markup = render(screen)
     text = ScheduleHTML(text).limited(4096)
     payload = {"text": text, "parse_mode": "HTML"}
-    if photo:
-        payload = {"rich_message": photo_message(text, photo)}
+    if attachment:
+        payload = {"rich_message": attachment_message(text, attachment)}
+    unavailable = "\n\n📎 Файл временно недоступен." if isinstance(attachment, InputMediaDocument) else "\n\n📸 Фото временно недоступно."
     photo_fallback = {
-        "text": ScheduleHTML(text + "\n\n📸 Фото временно недоступно.").limited(4096),
+        "text": ScheduleHTML(text + unavailable).limited(4096),
         "parse_mode": "HTML",
     }
     used_photo_fallback = False
@@ -132,7 +154,7 @@ async def show_screen(
             await bot.edit_ephemeral_message_text(**target, **payload, reply_markup=markup)
         except (TelegramBadRequest, TelegramNotFound) as error:
             if "message is not modified" not in str(error).lower():
-                if not photo:
+                if not attachment:
                     raise
                 await bot.edit_ephemeral_message_text(**target, **photo_fallback, reply_markup=markup)
                 used_photo_fallback = True
@@ -153,7 +175,7 @@ async def show_screen(
             callback_query_id=callback.id, replace_callback_query_message=True,
         ),
     }
-    if photo:
+    if attachment:
         try:
             sent = await bot.send_rich_message(**destination, **payload)
         except (TelegramBadRequest, TelegramNotFound):
