@@ -417,6 +417,62 @@ class RouterTests(RouterCase):
             self.assertIn("Ошибки открытия · 1 из 3 (33%)", report)
             self.assertIn("вход из меню · 1", report)
 
+    async def test_homework_statistics_count_successful_student_views(self):
+        now = datetime(2026, 11, 16, 8)
+        for module in (main, analytics, storage, homework):
+            self.enterContext(patch.object(module, "get_now", return_value=now))
+        storage.bind_topic(-1007, 2, 42)
+        homework.save_assignment(homework.Assignment(subject=1, body="Уравнения"))
+        homework.save_assignment(homework.Assignment(subject=2, body="Разбор <темы>"))
+        topic = {"group": True, "thread_id": 2}
+
+        await self.feed(action="topic:hw", user_id=99, message_id=42, **topic)
+        student = {**topic, "user_id": 99, "ephemeral_id": self.session.message_id}
+        item_one = "topic:hw:item:1:active:0:0"
+        item_two = "topic:hw:item:2:active:0:0"
+        for callback_id in ("view-1", "view-1", "view-2", "view-3"):
+            await self.feed(action=item_one, callback_id=callback_id, **student)
+        await self.feed(action="topic:hw:item:999:active:0:0", callback_id="missing", **student)
+        self.session.failed_methods["EditEphemeralMessageText"] = "test error"
+        await self.feed(action=item_two, callback_id="failed", **student)
+        self.assertIn("Не удалось открыть", self.session.calls[-1].text)
+        self.session.failed_methods.clear()
+        for user_id in (98, 97, 11):
+            await self.feed(action="topic:hw", user_id=user_id, message_id=42, **topic)
+            await self.feed(action=item_two, user_id=user_id, ephemeral_id=self.session.message_id, **topic)
+
+        await self.feed(action="admin:hw", user_id=11)
+        keyboard = self.session.calls[-2].reply_markup
+        self.assertTrue(any(button.callback_data == "admin:hw:stats" for row in keyboard.inline_keyboard for button in row))
+        await self.feed(action="admin:hw:stats", user_id=99)
+        self.assertIn("Нет доступа", self.session.calls[-1].text)
+        await self.feed(action="admin:hw:stats", user_id=11, **topic)
+        self.assertIn("личном чате", self.session.calls[-1].text)
+        await self.feed(action="admin:hw:stats")
+        report = self.session.calls[-2].text
+        self.assertIn("Уникальных студентов за неделю · <b>3</b>", report)
+        self.assertIn("Открытий карточек · 5", report)
+        self.assertIn("Заданий с просмотрами · 2", report)
+        self.assertLess(report.index("Разбор &lt;темы&gt;"), report.index("Уравнения"))
+        await self.feed(action="admin:hw:item:1:active:0:0")
+        self.assertIn("За 7 дней · студентов 1, открытий 3", self.session.calls[-2].text)
+
+    async def test_homework_statistics_use_seven_local_calendar_days_and_prune_old_views(self):
+        day = datetime(2026, 11, 16, 8)
+        homework.save_assignment(homework.Assignment(subject=1, body="Упражнение"))
+        with patch.object(storage, "get_now", return_value=datetime(2026, 10, 1)):
+            analytics.record_homework_view("old", 99, datetime(2026, 10, 1), 1)
+        for module in (storage, analytics):
+            self.enterContext(patch.object(module, "get_now", return_value=day))
+        analytics.record_homework_view("before-window", 98, datetime(2026, 11, 9, 23, 59), 1)
+        analytics.record_homework_view("start-of-window", 97, datetime(2026, 11, 10), 1)
+        report = analytics.homework_report()
+        self.assertIn("10.11–16.11", report)
+        self.assertIn("Уникальных студентов сегодня · 0", report)
+        self.assertIn("Открытий карточек · 1", report)
+        with storage.connection() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM homework_views").fetchone()[0], 2)
+
     async def test_weekly_statistics_preserve_first_publication_and_exclude_old_requests(self):
         schedule_date = "2026-11-17"
         first_publish = datetime(2026, 11, 16, 18, 15)

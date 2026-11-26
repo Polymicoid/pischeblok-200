@@ -1,10 +1,12 @@
 import hmac
-from datetime import datetime, timedelta
+import html
+from datetime import date, datetime, timedelta
 from math import ceil
 from statistics import median
 
-from schedule import get_now
-from storage import connection, prune_schedule_requests
+from homework import subject_label
+from schedule import get_now, truncate_plain
+from storage import connection, prune_homework_views, prune_schedule_requests
 
 DAYS = ("today", "tomorrow")
 ACTION_LABELS = {
@@ -32,11 +34,75 @@ def record_request(
         """, (event_key, student_key, started_at.isoformat(timespec="seconds"), action, status, result, duration_ms))
 
 
-def weekly_report() -> str:
+def record_homework_view(callback_id: str, user_id: int, started_at: datetime, assignment_id: int):
+    with connection() as conn:
+        secret, = conn.execute("SELECT value FROM settings WHERE key = 'analytics_secret'").fetchone()
+        key = bytes.fromhex(secret)
+        event_key = hmac.digest(key, f"homework-view:{callback_id}".encode(), "sha256")
+        student_key = hmac.digest(key, f"homework-student:{user_id}".encode(), "sha256")
+        prune_homework_views(conn)
+        conn.execute("""
+            INSERT OR IGNORE INTO homework_views (event_key, student_key, occurred_at, assignment_id)
+            SELECT ?, ?, ?, id FROM homework WHERE id = ?
+        """, (event_key, student_key, started_at.isoformat(timespec="seconds"), assignment_id))
+
+
+def report_dates() -> tuple[date, date, date]:
     today = get_now().date()
-    first_day = today - timedelta(days=6)
+    return today - timedelta(days=6), today, today + timedelta(days=1)
+
+
+def homework_view_counts(assignment_id: int) -> tuple[int, int]:
+    first_day, _, tomorrow = report_dates()
+    with connection() as conn:
+        return conn.execute("""
+            SELECT COUNT(DISTINCT student_key), COUNT(*)
+            FROM homework_views WHERE assignment_id = ? AND occurred_at >= ? AND occurred_at < ?
+        """, (assignment_id, first_day.isoformat(), tomorrow.isoformat())).fetchone()
+
+
+def homework_report() -> str:
+    first_day, today, tomorrow = report_dates()
+    bounds = (first_day.isoformat(), tomorrow.isoformat())
+    with connection() as conn:
+        prune_homework_views(conn)
+        students, students_today, views, assignments = conn.execute("""
+            SELECT COUNT(DISTINCT student_key),
+                   COUNT(DISTINCT CASE WHEN occurred_at >= ? THEN student_key END),
+                   COUNT(*), COUNT(DISTINCT assignment_id)
+            FROM homework_views WHERE occurred_at >= ? AND occurred_at < ?
+        """, (today.isoformat(), *bounds)).fetchone()
+        top = conn.execute("""
+            SELECT h.subject, h.body, COUNT(DISTINCT v.student_key) AS students, COUNT(*) AS views
+            FROM homework_views v JOIN homework h ON h.id = v.assignment_id
+            WHERE v.occurred_at >= ? AND v.occurred_at < ?
+            GROUP BY h.id
+            ORDER BY students DESC, views DESC, h.id DESC LIMIT 5
+        """, bounds).fetchall()
+
+    lines = [
+        f"📊 <b>Домашние задания за 7 дней</b> · {first_day:%d.%m}–{today:%d.%m}",
+        "",
+        f"Уникальных студентов за неделю · <b>{students}</b>",
+        f"Уникальных студентов сегодня · {students_today}",
+        f"Открытий карточек · {views}",
+        f"Заданий с просмотрами · {assignments}",
+    ]
+    if top:
+        lines.extend(("", "<b>Задания с наибольшим охватом</b>"))
+        for subject, body, reach, opens in top:
+            title = truncate_plain(" ".join(body.split()) or "Материалы", 80)
+            lines.append(f"• {html.escape(subject_label(subject, short=True))} · {html.escape(title)}")
+            lines.append(f"  {reach} студ. · {opens} откр.")
+    else:
+        lines.extend(("", "Данные появятся после первых открытий карточек студентами."))
+    return "\n".join(lines)
+
+
+def weekly_report() -> str:
+    first_day, today, tomorrow = report_dates()
     since = first_day.isoformat()
-    until = (today + timedelta(days=1)).isoformat()
+    until = tomorrow.isoformat()
     with connection() as conn:
         prune_schedule_requests(conn)
         rows = conn.execute("""

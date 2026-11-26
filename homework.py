@@ -200,7 +200,7 @@ def list_view(screen: str, *, admin: bool = False) -> tuple[str, InlineKeyboardM
         """, (*args, PAGE_SIZE, page * PAGE_SIZE)).fetchall()
     buttons = []
     if admin:
-        buttons.append([key("➕ Добавить домашку", "hw:new", True)])
+        buttons.append([key("➕ Добавить домашку", "hw:new", True), key("📊 Статистика", "hw:stats", True)])
     for assignment_id, index, body, due, next_lesson in rows:
         title = " ".join(body.split()) or "Материалы"
         due_label = deadline_label(due, next_lesson, short=True)

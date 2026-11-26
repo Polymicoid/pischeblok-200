@@ -307,12 +307,14 @@ async def cb_topic_screen(callback: CallbackQuery, bot: Bot):
         return
 
     action = "text" if screen in group_interface.TEXT_SCREENS else screen
-    track = action in analytics.ACTION_LABELS and not is_admin(callback.from_user.id)
-    started_at = get_now() if track else None
+    student = not is_admin(callback.from_user.id)
+    track_schedule = student and action in analytics.ACTION_LABELS
+    homework_item = homework.ITEM_ROUTE.fullmatch(screen) if student else None
+    started_at = get_now() if track_schedule or homework_item else None
     started = perf_counter()
     status = None
     result = "ok"
-    if track and action in analytics.DAYS:
+    if track_schedule and action in analytics.DAYS:
         row = get_schedule(get_target_date(action).date().isoformat())
         status = row[0] if row else "missing"
     try:
@@ -324,7 +326,7 @@ async def cb_topic_screen(callback: CallbackQuery, bot: Bot):
     except TelegramAPIError as error:
         result = "error"
         LOGGER.warning("Персональный экран недоступен (%s)", type(error).__name__)
-    if track:
+    if track_schedule:
         try:
             analytics.record_request(
                 callback.id, callback.from_user.id, started_at, action, status, result,
@@ -332,6 +334,11 @@ async def cb_topic_screen(callback: CallbackQuery, bot: Bot):
             )
         except sqlite3.Error:
             LOGGER.exception("Не удалось записать статистику расписания")
+    if homework_item and result != "error":
+        try:
+            analytics.record_homework_view(callback.id, callback.from_user.id, started_at, int(homework_item[1]))
+        except sqlite3.Error:
+            LOGGER.exception("Не удалось записать просмотр домашнего задания")
     if result == "error":
         await callback.answer(
             "Не удалось открыть экран. Попробуй ещё раз из закреплённого меню темы.",
@@ -374,6 +381,7 @@ async def cb_admin_menu(callback: CallbackQuery, state: FSMContext):
 async def cb_admin_stats(callback: CallbackQuery):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:stats")],
+        [InlineKeyboardButton(text="📊 Домашние задания", callback_data="admin:hw:stats")],
         [InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin:menu")],
     ])
     await render_screen(callback.message, analytics.weekly_report(), keyboard)
@@ -381,6 +389,17 @@ async def cb_admin_stats(callback: CallbackQuery):
 
 
 # --- ДОМАШНИЕ ЗАДАНИЯ В АДМИНКЕ ---
+@router.callback_query(F.data == "admin:hw:stats")
+async def cb_hw_stats(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [homework.key("🔄 Обновить", "hw:stats", True)],
+        [homework.key("⬅️ К заданиям", "hw", True)],
+    ])
+    await render_screen(callback.message, analytics.homework_report(), keyboard)
+    await callback.answer()
+
+
 async def hw_prompt(
     message: Message, state: FSMContext, text: str, rows: list[list[InlineKeyboardButton]], *, edit: bool,
 ):
@@ -426,7 +445,9 @@ async def cb_hw_item(callback: CallbackQuery, state: FSMContext):
     if material:
         rows.append(material)
     rows.append([homework.key("⬅️ К заданиям", f"hw:{match[2]}:{match[3]}:{match[4]}", True)])
-    await render_screen(callback.message, homework.assignment_text(assignment), InlineKeyboardMarkup(inline_keyboard=rows))
+    students, views = analytics.homework_view_counts(assignment.id)
+    text = f"{homework.assignment_text(assignment)}\n\n📊 За 7 дней · студентов {students}, открытий {views}"
+    await render_screen(callback.message, text, InlineKeyboardMarkup(inline_keyboard=rows))
     await callback.answer()
 
 

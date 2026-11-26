@@ -126,11 +126,24 @@ def init_db():
             conn.execute("ALTER TABLE homework ADD COLUMN material_url TEXT")
         if "due_next_lesson" not in homework_columns:
             conn.execute("ALTER TABLE homework ADD COLUMN due_next_lesson INTEGER NOT NULL DEFAULT 0")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS homework_views (
+                event_key BLOB PRIMARY KEY NOT NULL,
+                student_key BLOB NOT NULL,
+                occurred_at TEXT NOT NULL,
+                assignment_id INTEGER NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS homework_views_by_time ON homework_views(occurred_at)")
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS homework_views_by_assignment ON homework_views(assignment_id, occurred_at)
+        """)
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('analytics_secret', ?)",
             (secrets.token_hex(32),),
         )
         prune_schedule_requests(conn)
+        prune_homework_views(conn)
         for k, v in DEFAULT_TIMINGS.items():
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
         conn.commit()
@@ -145,6 +158,11 @@ def get_setting(key: str, default: str = None):
 def prune_schedule_requests(conn: sqlite3.Connection):
     cutoff = (get_now() - timedelta(days=30)).isoformat(timespec="seconds")
     conn.execute("DELETE FROM schedule_requests WHERE occurred_at < ?", (cutoff,))
+
+
+def prune_homework_views(conn: sqlite3.Connection):
+    cutoff = (get_now() - timedelta(days=30)).isoformat(timespec="seconds")
+    conn.execute("DELETE FROM homework_views WHERE occurred_at < ?", (cutoff,))
 
 
 def set_setting(key: str, value: str):
