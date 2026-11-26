@@ -10,6 +10,7 @@ from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message, Update, User
 
+import analytics
 import main
 import schedule
 import storage
@@ -276,6 +277,52 @@ class RouterCase(DatabaseCase, unittest.IsolatedAsyncioTestCase):
 
 
 class RouterTests(RouterCase):
+    async def test_weekly_statistics_count_student_requests_and_require_private_admin(self):
+        now = datetime(2026, 11, 16, 8)
+        with patch.object(main, "get_now", return_value=now), patch.object(analytics, "get_now", return_value=now), patch.object(storage, "get_now", return_value=now):
+            storage.bind_topic(-1007, 2, 42)
+            storage.save_schedule("2026-11-17", "holiday")
+            topic = dict(group=True, thread_id=2, message_id=42)
+            await self.feed(action="topic:today", user_id=99, callback_id="today-1", **topic)
+            await self.feed(action="topic:today", user_id=99, callback_id="today-1", **topic)
+            await self.feed(action="topic:tomorrow", user_id=99, callback_id="tomorrow-1", **topic)
+            await self.feed(action="topic:today", user_id=11, callback_id="admin-check", **topic)
+            self.session.failed_methods["SendMessage"] = "test error"
+            await self.feed(action="topic:schedule", user_id=98, callback_id="menu-error", **topic)
+            self.session.failed_methods.clear()
+
+            await self.feed(action="admin:stats", user_id=99)
+            self.assertIn("Нет доступа", self.session.calls[-1].text)
+            await self.feed(action="admin:stats", user_id=11, **topic)
+            self.assertIn("личном чате", self.session.calls[-1].text)
+            await self.feed(action="admin:stats", user_id=11)
+            report = self.session.calls[-2].text
+            self.assertIn("Уникальных студентов за неделю · <b>1</b>", report)
+            self.assertIn("Запросы по дням · 2", report)
+            self.assertIn("Без опубликованного расписания · 1 из 2 (50%)", report)
+            self.assertIn("Запросы на выходной · 1", report)
+            self.assertIn("Ошибки открытия · 1 из 3 (33%)", report)
+            self.assertIn("вход из меню · 1", report)
+
+    async def test_weekly_statistics_preserve_first_publication_and_exclude_old_requests(self):
+        schedule_date = "2026-11-17"
+        first_publish = datetime(2026, 11, 16, 18, 15)
+        with patch.object(storage, "get_now", return_value=first_publish):
+            storage.save_schedule(schedule_date, "published", "Первая версия")
+            analytics.record_request("old", 99, datetime(2026, 10, 1), "tomorrow", "missing", "ok", 10)
+        with patch.object(storage, "get_now", return_value=datetime(2026, 11, 16, 19, 20)), patch.object(
+            analytics, "get_now", return_value=datetime(2026, 11, 16, 19, 20),
+        ):
+            storage.save_schedule(schedule_date, "published", "Исправлено")
+            analytics.record_request("new", 99, datetime(2026, 11, 16, 19), "tomorrow", "published", "photo_fallback", 100)
+            report = analytics.weekly_report()
+            self.assertIn("На 17.11 · 16.11 в 18:15", report)
+            self.assertNotIn("19:20", report)
+            self.assertIn("Запросы по дням · 1", report)
+            self.assertIn("Фото заменено текстом · 1", report)
+            with storage.connection() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM schedule_requests").fetchone()[0], 1)
+
     async def test_class_hour_question_and_no_choice_for_each_monday_and_thursday(self):
         for day in ("2026-11-16", "2026-11-19", "2026-11-23", "2026-11-26"):
             with self.subTest(day=day), patch.object(

@@ -101,7 +101,8 @@ def photo_message(text: str, photo: str) -> InputRichMessage:
 
 async def show_screen(
     callback: CallbackQuery, bot: Bot, message: Message, screen: str, thread_id: int | None,
-):
+) -> bool:
+    """Возвращает True, если Telegram принял текст вместо фото."""
     text, photo, markup = render(screen)
     text = ScheduleHTML(text).limited(4096)
     payload = {"text": text, "parse_mode": "HTML"}
@@ -111,6 +112,7 @@ async def show_screen(
         "text": ScheduleHTML(text + "\n\n📸 Фото временно недоступно.").limited(4096),
         "parse_mode": "HTML",
     }
+    used_photo_fallback = False
 
     chat_id, user_id = message.chat.id, callback.from_user.id
     scope = (chat_id, thread_id or 0, user_id)
@@ -133,10 +135,11 @@ async def show_screen(
                 if not photo:
                     raise
                 await bot.edit_ephemeral_message_text(**target, **photo_fallback, reply_markup=markup)
+                used_photo_fallback = True
         save_topic_screen(*scope, active_id, False)
         for stale_id in stale_ids - {active_id}:
             await remove_screen(bot, chat_id, user_id, stale_id)
-        return
+        return used_photo_fallback
 
     if active_id:
         # Закрытие старой подмены может вернуть закреп. Делаем это до открытия новой.
@@ -155,8 +158,10 @@ async def show_screen(
             sent = await bot.send_rich_message(**destination, **payload)
         except (TelegramBadRequest, TelegramNotFound):
             sent = await bot.send_message(**destination, **photo_fallback)
+            used_photo_fallback = True
     else:
         sent = await bot.send_message(**destination, **payload)
 
     if sent.ephemeral_message_id:
         save_topic_screen(*scope, sent.ephemeral_message_id, False)
+    return used_photo_fallback

@@ -2,7 +2,9 @@ import asyncio
 import html
 import logging
 import re
+import sqlite3
 from datetime import date
+from time import perf_counter
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramConflictError
@@ -15,8 +17,9 @@ from aiogram.types import (
     InputMediaPhoto, Message,
 )
 
-import storage
+import analytics
 import group_interface
+import storage
 from config import ConfigError, load_config
 from schedule import (
     ScheduleHTML, build_schedule_view, format_post_body, format_date_human, format_day_btn, format_schedule_blocks,
@@ -119,6 +122,7 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="⏱ Перерывы и пары", callback_data="admin:breaks"),
             InlineKeyboardButton(text="🏫 Кабинеты", callback_data="admin:rooms"),
         ],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats")],
         [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="menu:main")],
     ])
 
@@ -288,13 +292,33 @@ async def cb_topic_screen(callback: CallbackQuery, bot: Bot):
         await callback.answer("Кнопка устарела. Выбери раздел в закреплённом меню.", show_alert=True)
         return
 
+    action = "text" if screen in group_interface.TEXT_SCREENS else screen
+    track = action in analytics.ACTION_LABELS and not is_admin(callback.from_user.id)
+    started_at = get_now() if track else None
+    started = perf_counter()
+    status = None
+    result = "ok"
+    if track and action in analytics.DAYS:
+        row = get_schedule(get_target_date(action).date().isoformat())
+        status = row[0] if row else "missing"
     try:
         if screen == group_interface.CLOSE_SCREEN:
             await group_interface.close_screen(bot, message, callback.from_user.id, thread_id)
         else:
-            await group_interface.show_screen(callback, bot, message, screen, thread_id)
+            if await group_interface.show_screen(callback, bot, message, screen, thread_id):
+                result = "photo_fallback"
     except TelegramAPIError as error:
+        result = "error"
         LOGGER.warning("Персональный экран недоступен (%s)", type(error).__name__)
+    if track:
+        try:
+            analytics.record_request(
+                callback.id, callback.from_user.id, started_at, action, status, result,
+                round((perf_counter() - started) * 1000),
+            )
+        except sqlite3.Error:
+            LOGGER.exception("Не удалось записать статистику расписания")
+    if result == "error":
         await callback.answer(
             "Не удалось открыть экран. Попробуй ещё раз из закреплённого меню темы.",
             show_alert=True,
@@ -329,6 +353,16 @@ def admin_menu_text(user_id: int) -> str:
 async def cb_admin_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await render_screen(callback.message, admin_menu_text(callback.from_user.id), kb_admin_menu())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:stats")
+async def cb_admin_stats(callback: CallbackQuery):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:stats")],
+        [InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin:menu")],
+    ])
+    await render_screen(callback.message, analytics.weekly_report(), keyboard)
     await callback.answer()
 
 

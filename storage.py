@@ -1,6 +1,8 @@
 import os
+import secrets
 import sqlite3
 from contextlib import closing, contextmanager
+from datetime import timedelta
 from pathlib import Path
 
 from schedule import get_now
@@ -88,6 +90,29 @@ def init_db():
                 PRIMARY KEY (chat_id, thread_key, user_id)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS schedule_requests (
+                event_key BLOB PRIMARY KEY NOT NULL,
+                student_key BLOB NOT NULL,
+                occurred_at TEXT NOT NULL,
+                action TEXT NOT NULL,
+                schedule_status TEXT,
+                result TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS schedule_requests_by_time ON schedule_requests(occurred_at)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS first_schedule_publications (
+                schedule_date TEXT PRIMARY KEY NOT NULL,
+                published_at TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('analytics_secret', ?)",
+            (secrets.token_hex(32),),
+        )
+        prune_schedule_requests(conn)
         for k, v in DEFAULT_TIMINGS.items():
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
         conn.commit()
@@ -97,6 +122,11 @@ def get_setting(key: str, default: str = None):
     with connection() as conn:
         row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return row[0] if row else default
+
+
+def prune_schedule_requests(conn: sqlite3.Connection):
+    cutoff = (get_now() - timedelta(days=30)).isoformat(timespec="seconds")
+    conn.execute("DELETE FROM schedule_requests WHERE occurred_at < ?", (cutoff,))
 
 
 def set_setting(key: str, value: str):
@@ -211,8 +241,17 @@ def save_schedule(
     has_class_hour: int = 0,
     learned_rooms: tuple[tuple[str, str], ...] = (),
 ):
-    updated_at = get_now().strftime("%Y-%m-%d %H:%M")
+    now = get_now()
+    updated_at = now.strftime("%Y-%m-%d %H:%M")
     with connection() as conn:
+        if status == "published":
+            conn.execute("""
+                INSERT OR IGNORE INTO first_schedule_publications (schedule_date, published_at)
+                SELECT ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM schedules WHERE date_str = ? AND status = 'published'
+                )
+            """, (date_str, now.isoformat(timespec="seconds"), date_str))
         conn.execute("""
             INSERT INTO schedules (date_str, status, content, updated_at, photo_id, topic_msg_id, raw_content, has_class_hour)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
