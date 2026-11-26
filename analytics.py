@@ -127,7 +127,7 @@ def weekly_report() -> str:
     evening = {row[0] for row in day_requests if row[2] == "tomorrow" and "17" <= row[1][11:13]}
 
     lines = [
-        f"📊 <b>Статистика за 7 дней</b> · {first_day:%d.%m}–{today:%d.%m}",
+        f"📊 <b>Статистика расписания за 7 дней</b> · {first_day:%d.%m}–{today:%d.%m}",
         "",
         f"Уникальных студентов за неделю · <b>{len(unique_week)}</b>",
         f"Уникальных студентов сегодня · <b>{len(unique_today)}</b>",

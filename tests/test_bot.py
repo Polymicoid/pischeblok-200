@@ -306,6 +306,37 @@ class RouterCase(DatabaseCase, unittest.IsolatedAsyncioTestCase):
 
 
 class RouterTests(RouterCase):
+    async def test_admin_panel_groups_schedule_actions_and_returns_to_the_right_menu(self):
+        await self.feed(action="menu:main")
+        self.assertIn("/set_topic", self.session.calls[-1].text)
+        storage.bind_topic(-1001234567890, 2, 42)
+        await self.feed(text="/start")
+        panel = self.session.calls[-1].reply_markup.inline_keyboard
+        self.assertEqual([button.callback_data for row in panel for button in row], [
+            "admin:schedule", "admin:hw", None,
+        ])
+        self.assertEqual(panel[-1][0].url, "https://t.me/c/1234567890/2/42")
+
+        await self.feed(action="admin:schedule", user_id=99)
+        self.assertIn("Нет доступа", self.session.calls[-1].text)
+        await self.feed(action=panel[0][0].callback_data)
+        screen = self.session.calls[-2]
+        self.assertIn("Управление расписанием", screen.text)
+        actions = [button.callback_data for row in screen.reply_markup.inline_keyboard for button in row]
+        self.assertEqual(actions, [
+            "admin:day:today:2026-11-16", "admin:day:tomorrow:2026-11-17",
+            "admin:breaks", "admin:rooms", "admin:stats", "admin:menu",
+        ])
+        for action in actions[:-1]:
+            with self.subTest(action=action):
+                await self.feed(action=action)
+                back = self.session.calls[-2].reply_markup.inline_keyboard[-1][0]
+                self.assertEqual(back.callback_data, "admin:schedule")
+                await self.feed(action=back.callback_data)
+                self.assertIn("Управление расписанием", self.session.calls[-2].text)
+        await self.feed(action=actions[-1])
+        self.assertEqual(self.session.calls[-2].reply_markup.inline_keyboard, panel)
+
     async def test_homework_forward_materials_next_lesson_publish_and_edit(self):
         now = datetime(2026, 11, 16, 21, tzinfo=timezone.utc)
         self.enterContext(patch.object(main, "get_now", return_value=now))

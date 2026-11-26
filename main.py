@@ -124,18 +124,40 @@ async def render_screen(message: Message, text: str, reply_markup: InlineKeyboar
 
 
 # --- КЛАВИАТУРЫ ---
-def kb_admin_menu() -> InlineKeyboardMarkup:
+def pinned_menu_url() -> str | None:
+    chat_id, thread_id = get_topic_config()
+    menu_id = get_setting("topic_menu_msg_id", "") or ""
+    channel_id = -chat_id - 10**12 if chat_id else 0
+    if channel_id <= 0 or not re.fullmatch(r"[1-9][0-9]*", menu_id):
+        return None
+    topic = f"{thread_id}/" if thread_id else ""
+    return f"https://t.me/c/{channel_id}/{topic}{menu_id}"
+
+
+def kb_admin_menu(pin_url: str | None) -> InlineKeyboardMarkup:
+    destination = {"url": pin_url} if pin_url else {"callback_data": "menu:main"}
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"📅 Управление: {format_day_btn('today')}", callback_data=admin_day_action("day", "today"))],
-        [InlineKeyboardButton(text=f"📅 Управление: {format_day_btn('tomorrow')}", callback_data=admin_day_action("day", "tomorrow"))],
+        [InlineKeyboardButton(text="📅 Расписание", callback_data="admin:schedule")],
+        [InlineKeyboardButton(text="📝 Домашние задания", callback_data="admin:hw")],
+        [InlineKeyboardButton(text="🏠 В главное меню", **destination)],
+    ])
+
+
+def kb_admin_schedule() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=format_day_btn("today"), callback_data=admin_day_action("day", "today"))],
+        [InlineKeyboardButton(text=format_day_btn("tomorrow"), callback_data=admin_day_action("day", "tomorrow"))],
         [
             InlineKeyboardButton(text="⏱ Перерывы и пары", callback_data="admin:breaks"),
             InlineKeyboardButton(text="🏫 Кабинеты", callback_data="admin:rooms"),
         ],
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats")],
-        [InlineKeyboardButton(text="📝 Домашние задания", callback_data="admin:hw")],
-        [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="menu:main")],
+        [InlineKeyboardButton(text="📊 Статистика расписания", callback_data="admin:stats")],
+        [InlineKeyboardButton(text="⬅️ В панель старосты", callback_data="admin:menu")],
     ])
+
+
+def back_to_admin_schedule() -> InlineKeyboardButton:
+    return InlineKeyboardButton(text="⬅️ К расписанию", callback_data="admin:schedule")
 
 
 def kb_admin_breaks() -> InlineKeyboardMarkup:
@@ -151,7 +173,7 @@ def kb_admin_breaks() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=f"2-й: {get_timing_int('sat_break_2')}м", callback_data="admin:editbrk:sat_break_2"),
             InlineKeyboardButton(text=f"ост: {get_timing_int('sat_break_other')}м", callback_data="admin:editbrk:sat_break_other"),
         ],
-        [InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin:menu")],
+        [back_to_admin_schedule()],
     ])
 
 
@@ -168,7 +190,7 @@ def kb_admin_rooms(has_rooms: bool) -> InlineKeyboardMarkup:
     rows = []
     if has_rooms:
         rows.append([InlineKeyboardButton(text="🗑 Очистить все запомненные кабинеты", callback_data="admin:rooms_clear")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin:menu")])
+    rows.append([back_to_admin_schedule()])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -179,7 +201,7 @@ def kb_admin_day(day_key: str, has_schedule: bool) -> InlineKeyboardMarkup:
     ]
     if has_schedule:
         rows.append([InlineKeyboardButton(text="🗑 Сбросить («Не опубликовано»)", callback_data=admin_day_action("clear", day_key))])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin:menu")])
+    rows.append([back_to_admin_schedule()])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -355,7 +377,9 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer("Личный чат доступен старостам. Расписание открывается из закрепа в теме группы.")
         return
     await state.clear()
-    await message.answer(admin_menu_text(message.from_user.id), reply_markup=kb_admin_menu(), parse_mode="HTML")
+    await message.answer(
+        admin_menu_text(message.from_user.id), reply_markup=kb_admin_menu(pinned_menu_url()), parse_mode="HTML",
+    )
 
 
 def admin_menu_text(user_id: int) -> str:
@@ -367,13 +391,27 @@ def admin_menu_text(user_id: int) -> str:
     else:
         header = "🔐 <b>Панель старосты</b>"
 
-    return f"{header}\n{group_interface.BRAND}\n\n{topic_status}\n\nВыбери действие:"
+    return f"{header}\n{group_interface.BRAND}\n\n{topic_status}"
 
 
-@router.callback_query(F.data == "admin:menu")
+@router.callback_query(F.data.in_({"admin:menu", "menu:main"}))
 async def cb_admin_menu(callback: CallbackQuery, state: FSMContext):
+    pin_url = pinned_menu_url()
+    if callback.data == "menu:main" and not pin_url:
+        await callback.answer(
+            "Ссылка на закреп недоступна. Открой меню в группе или закрепи его командой /set_topic в нужной теме.",
+            show_alert=True,
+        )
+        return
     await state.clear()
-    await render_screen(callback.message, admin_menu_text(callback.from_user.id), kb_admin_menu())
+    await render_screen(callback.message, admin_menu_text(callback.from_user.id), kb_admin_menu(pin_url))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:schedule")
+async def cb_admin_schedule(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await render_screen(callback.message, "📅 <b>Управление расписанием</b>", kb_admin_schedule())
     await callback.answer()
 
 
@@ -381,8 +419,7 @@ async def cb_admin_menu(callback: CallbackQuery, state: FSMContext):
 async def cb_admin_stats(callback: CallbackQuery):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:stats")],
-        [InlineKeyboardButton(text="📊 Домашние задания", callback_data="admin:hw:stats")],
-        [InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin:menu")],
+        [back_to_admin_schedule()],
     ])
     await render_screen(callback.message, analytics.weekly_report(), keyboard)
     await callback.answer()
