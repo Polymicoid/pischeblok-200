@@ -2,8 +2,9 @@ import html
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageOriginChannel
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from schedule import TIMEZONE_OFFSET, get_now, normalize_subject, pick_subject_emoji, subject_key, truncate_plain
 from storage import connection
@@ -17,7 +18,7 @@ SUBJECTS = (
 )
 SUBJECT_BUTTONS = {11: "ОБЗР", 12: "ОИД"}
 PAGE_SIZE = 6
-SOURCE_LINK = re.compile(r"https://t\.me/(?:c/[0-9]+|[A-Za-z0-9_]+)/[0-9]+(?:/[0-9]+)?(?:\?(?:single|thread=[0-9]+))?/?")
+NEXT_LESSON = "К следующей паре"
 LIST_ROUTE = re.compile(r"hw:(active|archive):([0-9]{1,2}):([0-9]{1,8})")
 ITEM_ROUTE = re.compile(r"hw:item:([0-9]{1,18}):(active|archive):([0-9]{1,2}):([0-9]{1,8})")
 SUBJECT_ROUTE = re.compile(r"hw:subjects:(active|archive)")
@@ -31,7 +32,8 @@ class Assignment:
     due_on: str | None = None
     photo_id: str | None = None
     document_id: str | None = None
-    source_url: str | None = None
+    material_url: str | None = None
+    due_next_lesson: bool = False
     archived: bool = False
 
 
@@ -70,53 +72,64 @@ def suggested_deadline(text: str, published_at: datetime) -> date | None:
     return local_day + timedelta(days=int("завтра" in hits))
 
 
-def parse_content(message: Message, group_id: int | None) -> dict:
+def parse_material_url(value: str) -> str:
+    url = value.strip()
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+        if (
+            parsed.scheme in {"http", "https"} and parsed.hostname
+            and parsed.username is None and port != 0
+            and not any(char.isspace() or ord(char) < 32 or char in '<>\\' for char in url)
+        ):
+            return url
+    except ValueError:
+        pass
+    raise ValueError("Пришли одну ссылку на материал, начиная с https:// или http://.")
+
+
+def attachment_ids(message: Message) -> dict:
+    return dict(
+        photo_id=message.photo[-1].file_id if message.photo else None,
+        document_id=message.document.file_id if message.document else None,
+    )
+
+
+def parse_content(message: Message) -> dict:
     body = (message.text or message.caption or "").strip()
-    lines = body.splitlines()
-    source = None
-    if lines and lines[-1].casefold().startswith("источник:"):
-        source = lines.pop().partition(":")[2].strip()
-        if not SOURCE_LINK.fullmatch(source):
-            raise ValueError("В строке «Источник» нужна ссылка на конкретное сообщение Telegram.")
-        body = "\n".join(lines).strip()
-    forward = message.forward_origin
-    if not source and isinstance(forward, MessageOriginChannel) and forward.chat.id == group_id:
-        chat_id = str(forward.chat.id).removeprefix("-100")
-        source = f"https://t.me/c/{chat_id}/{forward.message_id}"
-    photo_id = message.photo[-1].file_id if message.photo else None
-    document_id = message.document.file_id if message.document else None
-    if not any((body, source, photo_id, document_id)):
-        raise ValueError("Пришли текст, фото, документ или ссылку в строке «Источник».")
+    attachment = attachment_ids(message)
+    if not body and not any(attachment.values()):
+        raise ValueError("Пришли текст, фото или документ.")
     if len(body.encode("utf-16-le")) // 2 > 3000:
         raise ValueError("Сократи описание до 3000 символов. Подробности можно оставить в файле.")
+    forward = message.forward_origin
     due = suggested_deadline(body, forward.date if forward else message.date)
-    return dict(
-        body=body, photo_id=photo_id, document_id=document_id, source_url=source,
-        suggested_due=due.isoformat() if due else None,
-    )
+    return dict(body=body, **attachment, suggested_due=due.isoformat() if due else None)
 
 
 def get_assignment(assignment_id: int) -> Assignment | None:
     with connection() as conn:
         row = conn.execute("""
-            SELECT id, subject, body, due_on, photo_id, document_id, source_url, archived
+            SELECT id, subject, body, due_on, photo_id, document_id, material_url, due_next_lesson, archived
             FROM homework WHERE id = ?
         """, (assignment_id,)).fetchone()
-    return Assignment(*row) if row else None
+    if row is None:
+        return None
+    return Assignment(*row[:-2], due_next_lesson=bool(row[-2]), archived=bool(row[-1]))
 
 
 def save_assignment(assignment: Assignment) -> bool:
     values = (assignment.subject, assignment.body, assignment.due_on,
-              assignment.photo_id, assignment.document_id, assignment.source_url)
+              assignment.photo_id, assignment.document_id, assignment.material_url, assignment.due_next_lesson)
     with connection() as conn:
         if assignment.id is None:
             conn.execute("""
-                INSERT INTO homework (subject, body, due_on, photo_id, document_id, source_url)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO homework (subject, body, due_on, photo_id, document_id, material_url, due_next_lesson)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """, values)
             return True
         return conn.execute("""
-            UPDATE homework SET subject=?, body=?, due_on=?, photo_id=?, document_id=?, source_url=?
+            UPDATE homework SET subject=?, body=?, due_on=?, photo_id=?, document_id=?, material_url=?, due_next_lesson=?
             WHERE id=?
         """, (*values, assignment.id)).rowcount == 1
 
@@ -128,15 +141,21 @@ def set_archived(assignment_id: int, archived: bool) -> bool:
         ).rowcount == 1
 
 
+def deadline_label(due_on: str | None, next_lesson: bool, *, short: bool = False) -> str:
+    if due_on:
+        return date.fromisoformat(due_on).strftime("%d.%m" if short else "%d.%m.%Y")
+    return NEXT_LESSON if next_lesson else "без срока"
+
+
 def assignment_text(assignment: Assignment) -> str:
-    due = date.fromisoformat(assignment.due_on).strftime("%d.%m.%Y") if assignment.due_on else "не указан"
+    due = deadline_label(assignment.due_on, assignment.due_next_lesson)
     body = f"\n\n{html.escape(assignment.body)}" if assignment.body else ""
     attachment = "\n\n📎 Материалы прикреплены к заданию." if assignment.photo_id or assignment.document_id else ""
     return f"<b>{subject_label(assignment.subject)}</b>\n📅 Срок · {due}{body}{attachment}"
 
 
-def source_button(assignment: Assignment) -> list[InlineKeyboardButton]:
-    return [InlineKeyboardButton(text="🔗 Исходное сообщение", url=assignment.source_url)] if assignment.source_url else []
+def material_button(assignment: Assignment) -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton(text="🔗 Открыть материал", url=assignment.material_url)] if assignment.material_url else []
 
 
 def valid_student_screen(screen: str) -> bool:
@@ -172,19 +191,19 @@ def list_view(screen: str, *, admin: bool = False) -> tuple[str, InlineKeyboardM
         if subject:
             predicate += " AND subject = ?"
             args += (subject if subject < len(SUBJECTS) else 0,)
-        ordering = "due_on DESC, id DESC" if archived else "due_on IS NULL, due_on, id DESC"
+        ordering = "due_on DESC, id DESC" if archived else "due_on IS NULL, due_next_lesson DESC, due_on, id DESC"
         count, = conn.execute(f"SELECT COUNT(*) FROM homework WHERE {predicate}", args).fetchone()
         page = min(page, max(count - 1, 0) // PAGE_SIZE)
         rows = conn.execute(f"""
-            SELECT id, subject, body, due_on FROM homework WHERE {predicate}
+            SELECT id, subject, body, due_on, due_next_lesson FROM homework WHERE {predicate}
             ORDER BY {ordering} LIMIT ? OFFSET ?
         """, (*args, PAGE_SIZE, page * PAGE_SIZE)).fetchall()
     buttons = []
     if admin:
         buttons.append([key("➕ Добавить домашку", "hw:new", True)])
-    for assignment_id, index, body, due in rows:
+    for assignment_id, index, body, due, next_lesson in rows:
         title = " ".join(body.split()) or "Материалы"
-        due_label = date.fromisoformat(due).strftime("%d.%m") if due else "без срока"
+        due_label = deadline_label(due, next_lesson, short=True)
         label = truncate_plain(f"{due_label} · {subject_label(index, short=True)} · {title}", 62)
         buttons.append([key(label, f"hw:item:{assignment_id}:{mode}:{subject}:{page}", admin)])
     pages = []

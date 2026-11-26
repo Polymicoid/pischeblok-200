@@ -84,6 +84,7 @@ class AdminStates(StatesGroup):
     waiting_break_value = State()
     homework_subject = State()
     homework_content = State()
+    homework_materials = State()
     homework_deadline = State()
     homework_preview = State()
 
@@ -421,9 +422,9 @@ async def cb_hw_item(callback: CallbackQuery, state: FSMContext):
             rows.append([homework.key("📌 Вернуть из архива", f"hw:restore:{assignment.id}", True)])
         else:
             rows.append([homework.key("🗂 В архив", f"hw:archive-item:{assignment.id}", True)])
-    source = homework.source_button(assignment)
-    if source:
-        rows.append(source)
+    material = homework.material_button(assignment)
+    if material:
+        rows.append(material)
     rows.append([homework.key("⬅️ К заданиям", f"hw:{match[2]}:{match[3]}:{match[4]}", True)])
     await render_screen(callback.message, homework.assignment_text(assignment), InlineKeyboardMarkup(inline_keyboard=rows))
     await callback.answer()
@@ -469,11 +470,11 @@ async def hw_choose_subject(message: Message, state: FSMContext, subject: int, *
     assignment["subject"] = subject
     await state.update_data(hw_assignment=assignment)
     await state.set_state(AdminStates.homework_content)
-    rows = [[homework.key("Оставить текст и материалы", "hw:step:keep", True)]] if assignment["id"] else []
+    has_content = any(assignment[field] for field in ("body", "photo_id", "document_id", "material_url"))
+    rows = [[homework.key("Оставить описание", "hw:step:keep", True)]] if has_content else []
     text = (
         f"<b>{homework.subject_label(subject)}</b>\n\n"
-        "Напиши задание или перешли сообщение. Можно отправить одно фото или файл с описанием в подписи.\n\n"
-        "Для ссылки на пост добавь последней строкой «Источник: https://t.me/…»."
+        "Напиши, что нужно сделать. Можно переслать задание или отправить файл с описанием в подписи."
     )
     await hw_prompt(message, state, text, rows, edit=edit)
 
@@ -499,9 +500,11 @@ async def msg_hw_subject(message: Message, state: FSMContext):
     await hw_choose_subject(message, state, subject, edit=False)
 
 
-async def hw_choose_deadline(message: Message, state: FSMContext, suggested: str | None, *, edit: bool):
+async def hw_choose_deadline(message: Message, state: FSMContext, *, edit: bool):
     await state.set_state(AdminStates.homework_deadline)
-    assignment = (await state.get_data())["hw_assignment"]
+    data = await state.get_data()
+    assignment = data["hw_assignment"]
+    suggested = data.get("hw_suggested_due")
     today = get_now().date()
     choices = {today.isoformat(): "Сегодня", (today + timedelta(days=1)).isoformat(): "Завтра"}
     if suggested:
@@ -510,36 +513,108 @@ async def hw_choose_deadline(message: Message, state: FSMContext, suggested: str
     if existing_due and existing_due not in choices:
         choices[existing_due] = f"Оставить срок · {date.fromisoformat(existing_due):%d.%m.%Y}"
     rows = [[homework.key(label, f"hw:step:due:{value}", True)] for value, label in choices.items()]
+    rows.append([homework.key(homework.NEXT_LESSON, "hw:step:due:next", True)])
     rows.append([homework.key("Без срока", "hw:step:due:none", True)])
     await hw_prompt(message, state, "📅 Выбери срок или напиши дату в формате <b>ДД.ММ.ГГГГ</b>.", rows, edit=edit)
+
+
+async def hw_materials_prompt(message: Message, state: FSMContext, *, edit: bool):
+    await state.set_state(AdminStates.homework_materials)
+    draft = homework.Assignment(**(await state.get_data())["hw_assignment"])
+    text = (
+        "📎 <b>Материалы к заданию</b>\n\n"
+        "Пришли ссылку на учебник или методичку, файл или фото. Можно добавить одну ссылку и одно вложение."
+    )
+    has_attachment = draft.document_id or draft.photo_id
+    has_materials = has_attachment or draft.material_url
+    rows = []
+    if draft.body or has_materials:
+        rows.append([homework.key("Готово" if has_materials else "Пропустить", "hw:step:materials:done", True)])
+    if has_attachment:
+        text += "\n\n📎 Вложение добавлено."
+        rows.append([homework.key("Убрать вложение", "hw:step:materials:remove-file", True)])
+    if draft.material_url:
+        rows.append(homework.material_button(draft))
+        rows.append([homework.key("Убрать ссылку", "hw:step:materials:remove-link", True)])
+    rows.append([homework.key("⬅️ К описанию", "hw:step:materials:back", True)])
+    await hw_prompt(message, state, text, rows, edit=edit)
 
 
 @router.message(AdminStates.homework_content, F.chat.type == "private")
 async def msg_hw_content(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-    chat_id, _ = get_topic_config()
     try:
-        values = homework.parse_content(message, chat_id)
+        values = homework.parse_content(message)
     except ValueError as error:
         await message.answer(str(error))
         return
     suggested = values.pop("suggested_due")
     assignment = (await state.get_data())["hw_assignment"]
-    assignment.update(values)
-    await state.update_data(hw_assignment=assignment)
-    await hw_choose_deadline(message, state, suggested, edit=False)
+    assignment["body"] = values["body"]
+    if values["photo_id"] or values["document_id"]:
+        assignment.update(values)
+    await state.update_data(hw_assignment=assignment, hw_suggested_due=suggested)
+    await hw_materials_prompt(message, state, edit=False)
 
 
 @router.callback_query(F.data == "admin:hw:step:keep", AdminStates.homework_content)
 async def cb_hw_keep(callback: CallbackQuery, state: FSMContext):
-    await hw_choose_deadline(callback.message, state, None, edit=True)
+    await hw_materials_prompt(callback.message, state, edit=True)
     await callback.answer()
 
 
-async def hw_preview(message: Message, state: FSMContext, due: date | None, *, edit: bool):
+@router.message(AdminStates.homework_materials, F.chat.type == "private")
+async def msg_hw_material(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    assignment = (await state.get_data())["hw_assignment"]
+    attachment = homework.attachment_ids(message)
+    if any(attachment.values()):
+        assignment.update(attachment)
+    else:
+        try:
+            assignment["material_url"] = homework.parse_material_url(message.text or "")
+        except ValueError as error:
+            await message.answer(f"{error} Также можно прикрепить файл или фото.")
+            return
+    await state.update_data(hw_assignment=assignment)
+    await hw_materials_prompt(message, state, edit=False)
+
+
+@router.callback_query(
+    F.data.in_({"admin:hw:step:materials:done", "admin:hw:step:materials:remove-file", "admin:hw:step:materials:remove-link"}),
+    AdminStates.homework_materials,
+)
+async def cb_hw_materials(callback: CallbackQuery, state: FSMContext):
+    action = callback.data.rsplit(":", 1)[1]
+    assignment = (await state.get_data())["hw_assignment"]
+    if action == "done":
+        if not any(assignment[field] for field in ("body", "photo_id", "document_id", "material_url")):
+            await callback.answer("Добавь материал или вернись к описанию.", show_alert=True)
+            return
+        await hw_choose_deadline(callback.message, state, edit=True)
+    else:
+        if action == "remove-file":
+            assignment.update(photo_id=None, document_id=None)
+        else:
+            assignment["material_url"] = None
+        await state.update_data(hw_assignment=assignment)
+        await hw_materials_prompt(callback.message, state, edit=True)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:hw:step:materials:back", AdminStates.homework_materials)
+async def cb_hw_materials_back(callback: CallbackQuery, state: FSMContext):
+    assignment = (await state.get_data())["hw_assignment"]
+    await hw_choose_subject(callback.message, state, assignment["subject"], edit=True)
+    await callback.answer()
+
+
+async def hw_preview(message: Message, state: FSMContext, due: date | None, *, next_lesson: bool = False, edit: bool):
     assignment = (await state.get_data())["hw_assignment"]
     assignment["due_on"] = due.isoformat() if due else None
+    assignment["due_next_lesson"] = next_lesson
     await state.update_data(hw_assignment=assignment)
     await state.set_state(AdminStates.homework_preview)
     draft = homework.Assignment(**assignment)
@@ -549,21 +624,21 @@ async def hw_preview(message: Message, state: FSMContext, due: date | None, *, e
     rows = [[homework.key("✅ Опубликовать", "hw:step:save", True)]]
     rows.append([homework.key("✏️ Заменить текст или материалы", "hw:step:change-content", True)])
     rows.append([homework.key("📅 Изменить срок", "hw:step:change-due", True)])
-    source = homework.source_button(draft)
-    if source:
-        rows.append(source)
+    material = homework.material_button(draft)
+    if material:
+        rows.append(material)
     await hw_prompt(message, state, text, rows, edit=edit)
 
 
-@router.callback_query(F.data.regexp(r"^admin:hw:step:due:(?:none|[0-9]{4}-[0-9]{2}-[0-9]{2})$"), AdminStates.homework_deadline)
+@router.callback_query(F.data.regexp(r"^admin:hw:step:due:(?:next|none|[0-9]{4}-[0-9]{2}-[0-9]{2})$"), AdminStates.homework_deadline)
 async def cb_hw_deadline(callback: CallbackQuery, state: FSMContext):
     value = callback.data.rsplit(":", 1)[1]
     try:
-        due = homework.parse_deadline(value) if value != "none" else None
+        due = homework.parse_deadline(value) if value not in {"next", "none"} else None
     except ValueError:
         await callback.answer("Укажи корректную дату.", show_alert=True)
         return
-    await hw_preview(callback.message, state, due, edit=True)
+    await hw_preview(callback.message, state, due, next_lesson=value == "next", edit=True)
     await callback.answer()
 
 
@@ -574,14 +649,14 @@ async def msg_hw_deadline(message: Message, state: FSMContext):
     try:
         due = homework.parse_deadline(message.text)
     except ValueError:
-        await message.answer("Укажи корректную дату в формате ДД.ММ.ГГГГ или нажми «Без срока».")
+        await message.answer("Укажи корректную дату в формате ДД.ММ.ГГГГ или выбери срок кнопкой.")
         return
     await hw_preview(message, state, due, edit=False)
 
 
 @router.callback_query(F.data == "admin:hw:step:change-due", AdminStates.homework_preview)
 async def cb_hw_change_deadline(callback: CallbackQuery, state: FSMContext):
-    await hw_choose_deadline(callback.message, state, None, edit=True)
+    await hw_choose_deadline(callback.message, state, edit=True)
     await callback.answer()
 
 

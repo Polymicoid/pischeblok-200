@@ -29,6 +29,30 @@ class DatabaseCase:
 
 
 class ScheduleTests(DatabaseCase, unittest.TestCase):
+    def test_homework_migration_preserves_assignments_and_ignores_post_links(self):
+        with storage.connection() as conn:
+            conn.execute("DROP TABLE homework")
+            conn.execute("""
+                CREATE TABLE homework (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subject INTEGER NOT NULL, body TEXT NOT NULL, due_on TEXT,
+                    photo_id TEXT, document_id TEXT, source_url TEXT,
+                    archived INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            conn.execute("""
+                INSERT INTO homework (subject, body, due_on, document_id, source_url, archived)
+                VALUES (2, 'Упражнение', '2026-11-14', 'legacy-file', 'https://t.me/c/123/5', 1)
+            """)
+        storage.init_db()
+        assignment = homework.get_assignment(1)
+        self.assertEqual(assignment, homework.Assignment(
+            id=1, subject=2, body="Упражнение", due_on="2026-11-14", document_id="legacy-file", archived=True,
+        ))
+        _, attachment, keyboard = main.group_interface.render("hw:item:1:archive:0:0")
+        self.assertEqual(attachment.media, "legacy-file")
+        self.assertFalse(any(button.url for row in keyboard.inline_keyboard for button in row))
+
     def test_admin_ids(self):
         self.assertEqual(parse_admin_ids("11, 22"), {11, 22})
         for invalid in ("", "0", "-1", "11,11", "1,", "a", "9999999999999999"):
@@ -282,7 +306,7 @@ class RouterCase(DatabaseCase, unittest.IsolatedAsyncioTestCase):
 
 
 class RouterTests(RouterCase):
-    async def test_homework_forward_preview_publish_and_edit(self):
+    async def test_homework_forward_materials_next_lesson_publish_and_edit(self):
         now = datetime(2026, 11, 16, 21, tzinfo=timezone.utc)
         self.enterContext(patch.object(main, "get_now", return_value=now))
         self.enterContext(patch.object(homework, "get_now", return_value=now))
@@ -293,35 +317,55 @@ class RouterTests(RouterCase):
         await self.feed(action="admin:hw:new")
         await self.feed(action="admin:hw:step:subject:1")
         await self.feed(
-            text="На завтра: стр. 12, №3.\nИсточник: https://t.me/c/123/2/8",
-            document=True,
+            text="На завтра: стр. 12, №3.",
             forward_origin={"type": "hidden_user", "date": int(now.timestamp()), "sender_user_name": "Тест"},
         )
-        prompt = self.session.calls[-1]
+        self.assertIn("Материалы к заданию", self.session.calls[-1].text)
+        await self.feed(text="ftp://example.org/book.pdf")
+        self.assertIn("https://", self.session.calls[-1].text)
+        await self.feed(text="https://example.org/book.pdf")
+        await self.feed(document=True)
+        await self.feed(action="admin:hw:step:materials:done", message_id=self.session.message_id)
+        prompt = self.session.calls[-2]
         self.assertTrue(any(
             button.callback_data == "admin:hw:step:due:2026-11-18"
             for row in prompt.reply_markup.inline_keyboard for button in row
         ))
-        await self.feed(action="admin:hw:step:due:2026-11-18", message_id=self.session.message_id)
+        await self.feed(action="admin:hw:step:due:next", message_id=self.session.message_id)
+        self.assertIn("К следующей паре", self.session.calls[-2].text)
         self.assertIsNone(homework.get_assignment(1))
         await self.feed(action="admin:hw:step:save", message_id=self.session.message_id)
         assignment = homework.get_assignment(1)
-        self.assertEqual((assignment.subject, assignment.document_id, assignment.due_on), (1, "file", "2026-11-18"))
+        self.assertEqual((assignment.subject, assignment.document_id, assignment.due_on), (1, "file", None))
+        self.assertTrue(assignment.due_next_lesson)
+        self.assertEqual(assignment.material_url, "https://example.org/book.pdf")
+        with patch.object(homework, "get_now", return_value=datetime(2026, 12, 16)):
+            _, active = homework.list_view("hw")
+            self.assertTrue(active.inline_keyboard[0][0].text.startswith("К следующей паре"))
+            _, archived = homework.list_view("hw:archive:0:0")
+            self.assertFalse(any("К следующей паре" in row[0].text for row in archived.inline_keyboard))
 
         await self.feed(action="admin:hw:edit:1")
         await self.feed(action="admin:hw:step:subject:1")
         await self.feed(action="admin:hw:step:keep")
+        await self.feed(action="admin:hw:step:materials:remove-link")
+        await self.feed(action="admin:hw:step:materials:done")
         await self.feed(text="20.11.2026")
         await self.feed(action="admin:hw:step:save", message_id=self.session.message_id)
         assignment = homework.get_assignment(1)
         self.assertEqual((assignment.due_on, assignment.document_id), ("2026-11-20", "file"))
-        self.assertEqual(assignment.source_url, "https://t.me/c/123/2/8")
+        self.assertFalse(assignment.due_next_lesson)
+        self.assertIsNone(assignment.material_url)
+        self.assertEqual(assignment.body, "На завтра: стр. 12, №3.")
         self.assertFalse(any(getattr(call, "chat_id", None) == -1007 for call in self.session.calls))
 
     async def test_homework_archive_filter_and_document_use_the_personal_screen(self):
         self.enterContext(patch.object(homework, "get_now", return_value=datetime(2026, 11, 16, 9)))
         storage.bind_topic(-1007, 2, 42)
-        homework.save_assignment(homework.Assignment(subject=1, body="Задача <3", due_on="2026-11-16", document_id="file"))
+        homework.save_assignment(homework.Assignment(
+            subject=1, body="Задача <3", due_on="2026-11-16", document_id="file",
+            material_url="https://example.org/book.pdf",
+        ))
         homework.save_assignment(homework.Assignment(subject=2, body="Старое задание", due_on="2026-11-15"))
         homework.save_assignment(homework.Assignment(subject=0, body="Задание без срока"))
         topic = dict(user_id=99, group=True, thread_id=2)
@@ -343,6 +387,8 @@ class RouterTests(RouterCase):
         self.assertEqual(detail.ephemeral_message_id, 101)
         self.assertEqual(detail.rich_message.media[0].media.media, "file")
         self.assertIn("Задача &lt;3", detail.rich_message.html)
+        link = detail.reply_markup.inline_keyboard[0][0]
+        self.assertEqual((link.text, link.url), ("🔗 Открыть материал", "https://example.org/book.pdf"))
 
     async def test_weekly_statistics_count_student_requests_and_require_private_admin(self):
         now = datetime(2026, 11, 16, 8)

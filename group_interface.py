@@ -58,9 +58,9 @@ def render(screen: str) -> tuple[str, str | InputMediaDocument | None, InlineKey
         rows = [[button("⬅️ К заданиям", f"hw:{item[2]}:{item[3]}:{item[4]}")], back]
         if assignment is None:
             return "Задание больше недоступно.", None, InlineKeyboardMarkup(inline_keyboard=rows)
-        source = homework.source_button(assignment)
-        if source:
-            rows.insert(0, source)
+        material = homework.material_button(assignment)
+        if material:
+            rows.insert(0, material)
         media = InputMediaDocument(media=assignment.document_id) if assignment.document_id else assignment.photo_id
         return homework.assignment_text(assignment), media, InlineKeyboardMarkup(inline_keyboard=rows)
     if screen in SECTIONS:

@@ -116,10 +116,16 @@ def init_db():
                 due_on TEXT,
                 photo_id TEXT,
                 document_id TEXT,
-                source_url TEXT,
+                material_url TEXT,
+                due_next_lesson INTEGER NOT NULL DEFAULT 0,
                 archived INTEGER NOT NULL DEFAULT 0
             )
         """)
+        homework_columns = {row[1] for row in conn.execute("PRAGMA table_info(homework)")}
+        if "material_url" not in homework_columns:
+            conn.execute("ALTER TABLE homework ADD COLUMN material_url TEXT")
+        if "due_next_lesson" not in homework_columns:
+            conn.execute("ALTER TABLE homework ADD COLUMN due_next_lesson INTEGER NOT NULL DEFAULT 0")
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('analytics_secret', ?)",
             (secrets.token_hex(32),),
